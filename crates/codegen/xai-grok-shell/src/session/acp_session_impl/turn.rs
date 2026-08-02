@@ -626,9 +626,45 @@ impl SessionActor {
         self.drain_between_turn_completions().await;
         let user_message = if user_images.is_empty() {
             user_message
-        } else if self.is_cursor_harness() {
-            self.transcribe_user_images(user_message, &user_images)
-                .await?
+        } else if self.is_cursor_harness()
+            || crate::session::image_describe::transcribe_images_enabled()
+        {
+            // 垫底逻辑：视觉辅助模型描述失败绝不让整回合报错——降级为
+            // "图片存盘 + 路径引用 + 降级说明"，回合照常继续。用户体验
+            // 优先于描述完整性（产品决策：报错中断不可接受）。
+            match self
+                .transcribe_user_images(user_message.clone(), &user_images)
+                .await
+            {
+                Ok(transcribed) => transcribed,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        "image transcription failed; falling back to file-path references"
+                    );
+                    let session_dir = crate::session::persistence::session_dir(
+                        &crate::session::info::Info {
+                            id: self.session_info.id.clone(),
+                            cwd: self.session_info.cwd.clone(),
+                        },
+                    );
+                    let base = crate::session::image_describe::persist_and_prepend_image_files(
+                        &session_dir,
+                        &user_images,
+                        &user_message,
+                    )
+                    .unwrap_or_else(|_| user_message.clone());
+                    format!(
+                        "{base}\n\n[Note: automatic image description was unavailable this \
+                         turn (the vision helper model call failed). The image files were \
+                         saved to the paths above; their visual content could not be \
+                         analyzed. Do NOT attempt to open or read these image files with \
+                         any tool in this session — the session's models cannot process \
+                         image content and such attempts will fail. Proceed with the text \
+                         request, and mention this limitation if the images are essential.]"
+                    )
+                }
+            }
         } else {
             let session_dir =
                 crate::session::persistence::session_dir(&crate::session::info::Info {
@@ -645,7 +681,9 @@ impl SessionActor {
                     .data(format!("failed to save user images to assets dir: {e}"))
             })?
         };
-        let attached_image_refs = if self.is_cursor_harness() {
+        let attached_image_refs = if self.is_cursor_harness()
+            || crate::session::image_describe::transcribe_images_enabled()
+        {
             Vec::new()
         } else {
             crate::session::placeholder_images::attached_image_references(&user_images)
@@ -697,7 +735,11 @@ impl SessionActor {
                 }
             };
             user_chat.set_prompt_index(current_prompt_index);
-            if !self.is_cursor_harness() {
+            // 转述模式下图片已转成文字描述进 user_message——不再把原图挂进
+            // 对话项，否则主请求仍内联图片（纯文本模型 400，转述白做）。
+            if !self.is_cursor_harness()
+                && !crate::session::image_describe::transcribe_images_enabled()
+            {
                 for image in &user_images {
                     user_chat.add_image(pick_user_image_url(image));
                 }
@@ -1878,6 +1920,15 @@ impl SessionActor {
                 )),
             );
             let mut request = request;
+            // 转述模式下主对话请求不应携带任何内联图片：新图已由 describe
+            // 管线转文字，但旧会话历史（转述启用前产生）仍可能嵌着 Image
+            // 块，会被纯文本端点（如智谱 coding）400 拒绝。发送前统一替换
+            // 为文字占位（仅主对话路径；describe 请求不经此处，不受影响）。
+            if crate::session::image_describe::transcribe_images_enabled() {
+                crate::session::image_describe::sanitize_inline_images_for_transcribe(
+                    &mut request.items,
+                );
+            }
             request.x_grok_session_id = Some(self.session_info.id.to_string());
             request.x_grok_turn_idx =
                 Some(self.chat_state_handle.get_prompt_index().await.to_string());

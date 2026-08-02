@@ -47,6 +47,53 @@ pub const IMAGE_DESCRIPTION_PROCESSING_LIMIT: usize = 16;
 pub const SKIPPED_IMAGE_MARKER: &str = "[skipped-due-to-limit]";
 /// Empty twin: no optional template is compiled in, nothing extra to strip.
 const OPTIONAL_CONTEXT_TAGS: &[&str] = &[];
+/// Opt-in switch for the image-transcription pipeline outside the Cursor
+/// harness: set `GROK_IMAGE_TRANSCRIBE=1` to route user images through the
+/// `image_description` vision model instead of inlining them into the main
+/// model request. Lets text-only main models (e.g. GLM-5.2 coding endpoint,
+/// which rejects image content blocks) accept pasted images.
+pub fn transcribe_images_enabled() -> bool {
+    std::env::var("GROK_IMAGE_TRANSCRIBE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+/// Placeholder stamped over historical inline images when the transcribe
+/// pipeline is active (see [`sanitize_inline_images_for_transcribe`]).
+pub const HISTORY_IMAGE_OMITTED: &str =
+    "[image from an earlier turn omitted: this model receives text only]";
+/// Strip every inline image from a request's conversation items, replacing
+/// them with [`HISTORY_IMAGE_OMITTED`] text. Used on the main-turn request
+/// path when transcription is enabled: new images are already transcribed
+/// to text, but sessions created before the pipeline existed still carry
+/// `Image` parts in user messages and `ToolResult.images` (read_file on an
+/// image/PDF), which text-only endpoints reject with 400.
+pub fn sanitize_inline_images_for_transcribe(
+    items: &mut [xai_grok_sampling_types::conversation::ConversationItem],
+) {
+    use xai_grok_sampling_types::conversation::{ContentPart, ConversationItem};
+    for item in items.iter_mut() {
+        match item {
+            ConversationItem::User(u) => {
+                for part in u.content.iter_mut() {
+                    if matches!(part, ContentPart::Image { .. }) {
+                        *part = ContentPart::Text {
+                            text: std::sync::Arc::<str>::from(HISTORY_IMAGE_OMITTED),
+                        };
+                    }
+                }
+            }
+            ConversationItem::ToolResult(t) => {
+                if !t.images.is_empty() {
+                    t.images.clear();
+                    let mut content = t.content.as_ref().to_owned();
+                    content.push('\n');
+                    content.push_str(HISTORY_IMAGE_OMITTED);
+                    t.content = std::sync::Arc::<str>::from(content);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 /// Strip template-specific context tags from text before it reaches the
 /// image-description prompt. Uses attribute-aware matching so tags like
 /// `<always_applied_workspace_rules type="...">` are caught.
@@ -457,10 +504,16 @@ pub async fn describe_user_images(
             });
         }
     }
+    // 部分第三方视觉模型（如智谱 glm-4v-flash）对 max_tokens 有硬上限
+    // （[1,1024]），默认 4096 会被 400 拒绝——允许经 env 下调。
+    let max_output_tokens: u32 = std::env::var("GROK_IMAGE_DESCRIBE_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_096);
     let request = ConversationRequest::from_items(vec![user_item])
         .with_model(model)
         .with_temperature(0.2)
-        .with_max_output_tokens(4_096);
+        .with_max_output_tokens(max_output_tokens);
     const DESCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
     let response = tokio::time::timeout(DESCRIBE_TIMEOUT, client.conversation_collect(request))
         .await
@@ -801,5 +854,44 @@ mod tests {
     fn strip_template_tags_does_not_false_match_prefix() {
         let input = "<rules_extra>keep me</rules_extra>";
         assert_eq!(strip_template_context_tags(input), input);
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+    use xai_grok_sampling_types::conversation::{ContentPart, ConversationItem};
+
+    #[test]
+    fn sanitize_strips_user_and_tool_result_images() {
+        let user = ConversationItem::user_with_parts(vec![
+            ContentPart::Text { text: std::sync::Arc::<str>::from("look") },
+            ContentPart::Image { url: std::sync::Arc::<str>::from("data:image/png;base64,AAAA") },
+        ]);
+        let tool = ConversationItem::tool_result_with_images(
+            "call-1",
+            "Read image file: a.png",
+            vec![ContentPart::Image {
+                url: std::sync::Arc::<str>::from("data:image/png;base64,BBBB"),
+            }],
+        );
+        let mut items = vec![user, tool];
+        sanitize_inline_images_for_transcribe(&mut items);
+        match &items[0] {
+            ConversationItem::User(u) => {
+                assert!(u.content.iter().all(|p| !matches!(p, ContentPart::Image { .. })));
+                assert!(u.content.iter().any(
+                    |p| matches!(p, ContentPart::Text { text } if text.contains(HISTORY_IMAGE_OMITTED))
+                ));
+            }
+            _ => panic!("expected User"),
+        }
+        match &items[1] {
+            ConversationItem::ToolResult(t) => {
+                assert!(t.images.is_empty());
+                assert!(t.content.contains(HISTORY_IMAGE_OMITTED));
+            }
+            _ => panic!("expected ToolResult"),
+        }
     }
 }
