@@ -776,12 +776,15 @@ async fn resolve_subagent_sampling_config(
     agent_name: &str,
     agent_model: &xai_grok_agent::config::ModelOverride,
     ctx: &SubagentSpawnContext,
-) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+) -> Result<(xai_grok_sampler::SamplerConfig, acp::ModelId), String> {
     use xai_grok_agent::config::ModelOverride;
     let (parent_config, parent_mid) = read_parent_sampling_config(ctx).await;
+    // Unknown falls through to inherit (long-standing behavior, distinct from
+    // ambiguity); a duplicate slug ABORTS the spawn — running on a first-match
+    // guess already sent traffic to a possibly-wrong endpoint once.
     let try_pin = |model_id: &str, source: &'static str, unknown_msg: &'static str| {
         match resolve_model_override_to_config(model_id, ctx) {
-            Some((config, canonical_id)) => {
+            Ok((config, canonical_id)) => {
                 log_subagent_model_resolution(
                     agent_name,
                     source,
@@ -789,12 +792,16 @@ async fn resolve_subagent_sampling_config(
                     &canonical_id,
                     &parent_config,
                 );
-                Some((config, canonical_id))
+                Ok(Some((config, canonical_id)))
             }
-            None => {
+            Err(crate::agent::models::ModelSelectionError::Unknown(_)) => {
                 tracing::warn!(agent = agent_name, model_id, "{unknown_msg}");
-                None
+                Ok(None)
             }
+            Err(crate::agent::models::ModelSelectionError::Ambiguous {
+                requested,
+                candidates,
+            }) => Err(ambiguous_override_message(&requested, &candidates)),
         }
     };
     if let Some(model_id) = ctx.subagent_model_overrides.get(agent_name)
@@ -802,18 +809,18 @@ async fn resolve_subagent_sampling_config(
             model_id,
             "config_override",
             "Subagent model override references unknown model, falling through to inherit",
-        )
+        )?
     {
-        return resolved;
+        return Ok(resolved);
     }
     if let ModelOverride::Override(model_id) = agent_model
         && let Some(resolved) = try_pin(
             model_id,
             "agent_definition",
             "Agent definition model references unknown model, falling through to inherit",
-        )
+        )?
     {
-        return resolved;
+        return Ok(resolved);
     }
     log_subagent_model_resolution(
         agent_name,
@@ -822,7 +829,7 @@ async fn resolve_subagent_sampling_config(
         &parent_mid,
         &parent_config,
     );
-    (parent_config, parent_mid)
+    Ok((parent_config, parent_mid))
 }
 /// Resolve a subagent's effective sampling config + model id, honoring the
 /// model-resolution precedence (Key Decision #16).
@@ -842,15 +849,23 @@ async fn resolve_effective_model_config(
     subagent_type: &str,
     definition_model: &xai_grok_agent::config::ModelOverride,
     ctx: &SubagentSpawnContext,
-) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+) -> Result<(xai_grok_sampler::SamplerConfig, acp::ModelId), String> {
     if let Some(model_id) = runtime_override_model {
-        if let Some(resolved) = resolve_model_override_to_config(model_id, ctx) {
-            return resolved;
+        match resolve_model_override_to_config(model_id, ctx) {
+            Ok(resolved) => return Ok(resolved),
+            Err(crate::agent::models::ModelSelectionError::Unknown(_)) => {
+                tracing::warn!(
+                    model_id,
+                    "Runtime model override references unknown model, falling through"
+                );
+            }
+            Err(crate::agent::models::ModelSelectionError::Ambiguous {
+                requested,
+                candidates,
+            }) => {
+                return Err(ambiguous_override_message(&requested, &candidates));
+            }
         }
-        tracing::warn!(
-            model_id,
-            "Runtime model override references unknown model, falling through"
-        );
     }
     resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
 }
@@ -1006,14 +1021,17 @@ fn subagent_auth_type(
 fn resolve_model_override_to_config(
     model_id: &str,
     ctx: &SubagentSpawnContext,
-) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
+) -> Result<
+    (xai_grok_sampler::SamplerConfig, acp::ModelId),
+    crate::agent::models::ModelSelectionError,
+> {
     use crate::agent::config::{resolve_credentials, sampling_config_for_model};
-    let entry = crate::agent::config::find_model_by_id(&ctx.available_models, model_id).cloned()?;
-    let canonical_model_id = if ctx.available_models.contains_key(model_id) {
-        acp::ModelId::new(model_id)
-    } else {
-        acp::ModelId::new(entry.info().model.clone())
-    };
+    // Strict, catalog-wide (v0.18.7-A review): first-match on a duplicate slug
+    // sent the request to a guessed endpoint before persistence could refuse
+    // to record it. Ambiguity is now the CALLER problem — refuse to spawn.
+    let selection =
+        crate::agent::models::resolve_override_ungated(&ctx.available_models, model_id)?;
+    let (canonical_model_id, entry) = selection.into_parts();
     let session_key = ctx.auth.as_ref().map(|a| a.key.as_str());
     let has_session_key = session_key.is_some();
     let mut credentials = resolve_credentials(&entry, session_key);
@@ -1039,7 +1057,25 @@ fn resolve_model_override_to_config(
             "auth_method_id" : ctx.auth_method_id.0.as_ref(), }
         )),
     );
-    Some((config, canonical_model_id))
+    Ok((config, canonical_model_id))
+}
+/// Human-readable refusal for an ambiguous explicit override. Listing the
+/// candidates with their endpoints is the actionable part: the fix is always
+/// "pin the config key instead of the shared model name".
+pub(crate) fn ambiguous_override_message(
+    requested: &str,
+    candidates: &[crate::agent::models::ModelCandidate],
+) -> String {
+    let listed = candidates
+        .iter()
+        .map(|c| format!("{} ({})", c.id, c.endpoint_label))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Subagent model '{requested}' matches more than one configured model: \
+         {listed}. Use the exact config key in [subagents.models] or the agent \
+         definition."
+    )
 }
 /// Leading items to preserve across compaction on resume: the System head only, so the
 /// resumed body (the child's own work) stays compactable. Returns 0 when there's no

@@ -906,34 +906,68 @@ impl acp::Agent for MvpAgent {
         let mut disallowed_custom: Option<String> = None;
         let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
         let build_custom_model_id = if is_chat_kind { None } else { custom_model_id };
-        let resolved_custom_model = build_custom_model_id
-            .and_then(|custom_model| match self
-                .resolve_model_id(&acp::ModelId::new(custom_model))
-            {
-                Ok(model) if model.info.user_selectable => {
-                    model_agent_type = Some(model.info().agent_type.clone());
-                    let origin_client = self
-                        .origin_client_info_from_meta(arguments.meta.as_ref());
-                    session_sampling_override = Some(
-                        self.prepare_sampling_config_for_model(&model, origin_client),
-                    );
-                    Some(custom_model)
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        requested_model = custom_model,
-                        "Requested model not allowed by allowed_models; falling back to current default model"
-                    );
-                    disallowed_custom = Some(custom_model.to_string());
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        requested_model = custom_model, fallback_model = % self
-                        .models_manager.current_model_id().0,
-                        "Requested model not found, falling back to current default model"
-                    );
-                    None
+        // `_meta.modelId` is client input, so it gets the same strict treatment
+        // as `setModel`: gated on `allowed_models`, and an id matching several
+        // entries is refused rather than resolved by position. Resolving here —
+        // *before* the session actor is built — is the point: the very same
+        // `ResolvedModelSelection` produces the initial sampling config and is
+        // handed to `apply_resolved` later, so a session can never be created on
+        // one entry and then recorded under another entry's key.
+        let resolved_custom_selection = build_custom_model_id
+            .and_then(|custom_model| {
+                let models = self.models_manager.models();
+                match crate::agent::models::resolve_requested_model(
+                    &models,
+                    &self.models_manager.available(),
+                    custom_model,
+                ) {
+                    Ok(selection) => {
+                        model_agent_type = Some(selection.entry().info().agent_type.clone());
+                        let origin_client = self
+                            .origin_client_info_from_meta(arguments.meta.as_ref());
+                        session_sampling_override = Some(
+                            self
+                                .prepare_sampling_config_for_model(
+                                    selection.entry(),
+                                    origin_client,
+                                ),
+                        );
+                        Some(selection)
+                    }
+                    Err(crate::agent::models::ModelSelectionError::Unknown(_)) => {
+                        // Configured but not selectable is the user's to fix in
+                        // settings; genuinely unknown is not. Only the former
+                        // earns the `allowed_models` notice.
+                        if self.resolve_model_trusted(custom_model).is_some() {
+                            tracing::warn!(
+                                requested_model = custom_model,
+                                "Requested model not allowed by allowed_models; falling back to current default model"
+                            );
+                            disallowed_custom = Some(custom_model.to_string());
+                        } else {
+                            tracing::warn!(
+                                requested_model = custom_model, fallback_model = % self
+                                .models_manager.current_model_id().0,
+                                "Requested model not found, falling back to current default model"
+                            );
+                        }
+                        None
+                    }
+                    Err(crate::agent::models::ModelSelectionError::Ambiguous {
+                        candidates,
+                        ..
+                    }) => {
+                        // Starting on a coin flip would bake the wrong endpoint
+                        // into the session identity from turn zero. Start on the
+                        // default and say why.
+                        tracing::warn!(
+                            requested_model = custom_model, candidate_count = candidates
+                            .len(),
+                            "Requested model matches several catalog entries; refusing to guess, starting on the default model"
+                        );
+                        disallowed_custom = Some(custom_model.to_string());
+                        None
+                    }
                 }
             });
         if model_agent_type.is_none() && custom_model_id.is_none()
@@ -982,8 +1016,13 @@ impl acp::Agent for MvpAgent {
         let model_id = match &session_initial_model {
             Some(chat_model) => acp::ModelId::new(chat_model.clone()),
             None => {
-                resolved_custom_model
-                    .map(acp::ModelId::new)
+                // The canonical catalog key, not the raw string the client
+                // sent: this id seeds the session handle and the first Summary
+                // write, so seeding it with a routing slug is what let a
+                // restore later re-resolve to a different provider's entry.
+                resolved_custom_selection
+                    .as_ref()
+                    .map(|selection| selection.catalog_key().clone())
                     .unwrap_or_else(|| self.models_manager.current_model_id())
             }
         };
@@ -1001,9 +1040,26 @@ impl acp::Agent for MvpAgent {
                         .current_or_expired()
                         .is_some_and(|a| a.is_zdr_team()),
                 });
+            // Both halves of the identity, each in its own field, in the very
+            // first write. `current_model_id` gets the sampling config's model
+            // — the upstream slug actually about to go over the wire, which is
+            // what every pre-`catalog_model_id` consumer expects there —
+            // NEVER the runtime key: an earlier revision wrote the key into
+            // both fields, which the new loader survives but legacy readers,
+            // sync peers, and anything else that treats `current_model_id` as
+            // an upstream model name does not. The catalog key is written only
+            // when the catalog knows the runtime id exactly (for a custom
+            // model that id IS the strictly-resolved key).
+            let (persisted_upstream_model, first_write_catalog_key) =
+                crate::agent::models::initial_persisted_identity(
+                    &self.models_manager.models(),
+                    &model_id,
+                    &session_sampling.model,
+                );
             crate::session::persistence::new(
                     &session_info,
-                    model_id,
+                    persisted_upstream_model,
+                    first_write_catalog_key,
                     summary_client,
                     self.storage_mode,
                     Some(self.auth_manager.clone()),
@@ -1064,6 +1120,7 @@ impl acp::Agent for MvpAgent {
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
                         session_model_id,
+                        persist_initial_model: true,
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd: None,
@@ -1108,16 +1165,16 @@ impl acp::Agent for MvpAgent {
                 xai_grok_telemetry::session_ctx::log_event_dual(internal_gate_open, ev);
             });
         }
-        if let Some(model_id) = resolved_custom_model {
+        // The selection resolved above, carried through unchanged — not a second
+        // lookup from the same string, which is how the two halves of the
+        // identity used to drift apart.
+        if let Some(selection) = resolved_custom_selection {
             let _ = crate::timed!(
                 log : "new_session: set_session_model", { crate
-                ::agent::handlers::model_switch::apply(self,
-                acp::SetSessionModelRequest::new(session_id.clone(),
-                acp::ModelId::new(model_id)),). await }
+                ::agent::handlers::model_switch::apply_resolved(self, session_id.clone(),
+                selection, None,). await }
             );
-            tracing::debug!(
-                session_id = % session_id.0, "new_session: set_session_model"
-            );
+            tracing::debug!(session_id = % session_id.0, "new_session: set_session_model");
         }
         if let Some(requested) = disallowed_custom {
             let current = self.models_manager.current_model_id();
@@ -1606,6 +1663,7 @@ impl acp::Agent for MvpAgent {
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
                         session_model_id: summary.current_model_id.clone(),
+                        persist_initial_model: false,
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd,
@@ -1718,7 +1776,7 @@ impl acp::Agent for MvpAgent {
         let persisted_model = summary.current_model_id.clone();
         let models = self.models_manager.models();
         let available = self.models_manager.available();
-        self.model_unavailable_sessions.borrow_mut().remove(session_id.0.as_ref());
+        self.model_blocked_sessions.borrow_mut().remove(session_id.0.as_ref());
         let resolved_catalog_key = resolve_catalog_key(&models, &persisted_model);
         tracing::debug!(
             session_id = % session_id.0, persisted = % persisted_model.0,
@@ -1734,12 +1792,32 @@ impl acp::Agent for MvpAgent {
         } else {
             available.keys().find(|id| !id.0.starts_with("grok-build")).cloned()
         };
-        let selectable_catalog_key = selectable_catalog_key_for_persisted(
+        // Identity first, fallbacks second. `catalog_model_id` is the exact key
+        // this session ran on and is honored unconditionally; only when it is
+        // absent (a pre-v0.18.6 record) do we fall back to matching the
+        // persisted routing slug, and a slug that matches several entries is
+        // reported as ambiguous rather than resolved by position. The old
+        // `selectable_catalog_key_for_persisted` did the opposite — a `.rev()`
+        // last-wins scan — which is precisely how a session could come back on
+        // a different provider's endpoint.
+        let mut ambiguous_candidates: Option<Vec<crate::agent::models::ModelCandidate>> = None;
+        let resolved_identity = match crate::agent::models::resolve_persisted_model(
             &models,
             &available,
-            &persisted_model,
-        );
-        let model_id = if let Some(catalog_key) = selectable_catalog_key {
+            summary.catalog_model_id.as_ref().map(|k| k.0.as_ref()),
+            persisted_model.0.as_ref(),
+        ) {
+            crate::agent::models::PersistedModelResolution::Exact(id) => Some(id),
+            crate::agent::models::PersistedModelResolution::Migrated(id) => Some(id),
+            crate::agent::models::PersistedModelResolution::Ambiguous {
+                candidates, ..
+            } => {
+                ambiguous_candidates = Some(candidates);
+                None
+            }
+            crate::agent::models::PersistedModelResolution::NotFound => None,
+        };
+        let model_id = if let Some(catalog_key) = resolved_identity {
             if catalog_key != persisted_model {
                 tracing::info!(
                     session_id = % session_id.0, persisted = % persisted_model.0,
@@ -1757,7 +1835,50 @@ impl acp::Agent for MvpAgent {
                     ),
                 );
             }
-            catalog_key
+            Some(catalog_key)
+        } else if let Some(candidates) = ambiguous_candidates {
+            // Several entries share this slug. Any pick would be a coin flip
+            // written back as authoritative identity, so pick nothing: load the
+            // history, block prompting, and let the user say which one they
+            // meant. `model_blocked_sessions` already gives us exactly that
+            // hold — the session is unusable until a model is chosen either way.
+            let listed = candidates
+                .iter()
+                .map(|c| format!("{} ({})", c.id, c.endpoint_label))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                session_id = % session_id.0, persisted = % persisted_model.0,
+                candidates = % listed,
+                "load_session: persisted model id matches several catalog entries; refusing to guess, holding the session until the user chooses"
+            );
+            xai_grok_telemetry::unified_log::warn(
+                "load_session: ambiguous persisted model, session held for user choice",
+                Some(session_id.0.as_ref()),
+                Some(
+                    serde_json::json!(
+                        { "persisted_model" : persisted_model.0.as_ref(), "candidates"
+                        : candidates, }
+                    ),
+                ),
+            );
+            let reason = format!(
+                "\"{}\" matches more than one configured model ({listed}). Pick the one you meant to continue this session.",
+                persisted_model.0,
+            );
+            let empty_id = acp::ModelId::new(String::new());
+            self.send_model_auto_switched(&session_id, &persisted_model, &empty_id, &reason)
+                .await;
+            self.model_blocked_sessions
+                .borrow_mut()
+                .insert(
+                    session_id.0.to_string(),
+                    crate::agent::models::ModelSessionBlock::Ambiguous {
+                        requested: persisted_model.0.to_string(),
+                        candidates,
+                    },
+                );
+            None
         } else if available.is_empty() {
             tracing::warn!(
                 session_id = % session_id.0, persisted = % persisted_model.0,
@@ -1772,7 +1893,7 @@ impl acp::Agent for MvpAgent {
                     ),
                 ),
             );
-            persisted_model
+            Some(persisted_model)
         } else if let Some(fallback) = same_family_fallback {
             tracing::warn!(
                 session_id = % session_id.0, previous = % persisted_model.0, new = %
@@ -1790,7 +1911,7 @@ impl acp::Agent for MvpAgent {
                     &reason,
                 )
                 .await;
-            fallback
+            Some(fallback)
         } else {
             let fallback = available
                 .keys()
@@ -1826,16 +1947,27 @@ impl acp::Agent for MvpAgent {
                     &reason,
                 )
                 .await;
-            self.model_unavailable_sessions
+            self.model_blocked_sessions
                 .borrow_mut()
-                .insert(session_id.0.to_string(), persisted_model.clone());
-            fallback
+                .insert(
+                    session_id.0.to_string(),
+                    crate::agent::models::ModelSessionBlock::Unavailable {
+                        persisted_model: persisted_model.clone(),
+                    },
+                );
+            None
         };
         tracing::debug!(
-            session_id = % session_id.0, final_model_id = % model_id.0,
+            session_id = % session_id.0, final_model_id = ? model_id.as_ref().map(| m | m
+            .0.as_ref()),
             "load_session: resolved final model_id for set_session_model"
         );
-        {
+        // `None` means the identity could not be pinned — an ambiguous legacy
+        // slug, or nothing usable left in the catalog. The session still loads
+        // and its history is readable; it simply does not switch onto a guessed
+        // model. Prompting is already held by whichever branch produced `None`.
+        let mut restored_catalog_model_id: Option<acp::ModelId> = None;
+        if let Some(model_id) = model_id {
             let _timer = crate::instrumentation_timer!("session.restore_model");
             let restore_meta = summary
                 .reasoning_effort
@@ -1847,15 +1979,64 @@ impl acp::Agent for MvpAgent {
                     );
                     map
                 });
-            let _ = crate::agent::handlers::model_switch::apply(
-                    self,
-                    acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
-                        .meta(restore_meta),
-                )
-                .await;
+            // Trusted: restoring a session is not a user selection, so a
+            // hidden model that this session legitimately ran on must still
+            // restore (see `resolve_trusted_model`).
+            match self.resolve_model_trusted(model_id.0.as_ref()) {
+                Some(selection) => {
+                    let canonical_id = selection.catalog_key().clone();
+                    if crate::agent::handlers::model_switch::apply_resolved(
+                            self,
+                            session_id.to_owned(),
+                            selection,
+                            restore_meta,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        restored_catalog_model_id = Some(canonical_id);
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = % session_id.0, model_id = % model_id.0,
+                        "load_session: resolved model id no longer maps to exactly one catalog entry; leaving the session on its default model"
+                    );
+                }
+            }
         }
         let mut response_meta_map = serde_json::Map::new();
         response_meta_map.insert("sessionId".to_string(), serde_json::json!(session_id));
+        // Why this session cannot prompt yet, if it cannot. The block itself
+        // already stops the turn, but a client that only learns about it by
+        // getting an empty `EndTurn` on the user's first message has no way to
+        // show what happened or offer the fix — the ambiguity is only
+        // resolvable by the user, so it has to reach them at load time, not on
+        // a failed send.
+        if let Some(block) = self
+            .model_blocked_sessions
+            .borrow()
+            .get(session_id.0.as_ref())
+        {
+            let payload = match block {
+                crate::agent::models::ModelSessionBlock::Ambiguous {
+                    requested,
+                    candidates,
+                } => serde_json::json!({
+                    "kind": crate::agent::models::MODEL_AMBIGUOUS,
+                    "requested": requested,
+                    "candidates": candidates,
+                }),
+                crate::agent::models::ModelSessionBlock::Unavailable { persisted_model } => {
+                    serde_json::json!({
+                        "kind": "model_unavailable",
+                        "requested": persisted_model.0.as_ref(),
+                        "candidates": [],
+                    })
+                }
+            };
+            response_meta_map.insert("x.ai/modelBlock".to_string(), payload);
+        }
         if let Some(persist) = persist_data {
             response_meta_map.insert("x.ai/persist".to_string(), persist);
         }
@@ -1916,7 +2097,16 @@ impl acp::Agent for MvpAgent {
                     serde_json::json!(running_prompt_id),
                 );
         }
-        let model_state = self.model_state(Some(&session_id));
+        let mut model_state = self.model_state(Some(&session_id));
+        // `apply_resolved` is the authority for the restored session model.
+        // Keep the response pinned to that same canonical key even if a later
+        // compatibility update leaves the handle/global default momentarily
+        // stale. WanCode uses this value for its model picker; returning the
+        // startup default while sampling uses the restored entry makes the UI
+        // claim glm-open while requests actually go to glm-coding.
+        if let Some(restored_id) = restored_catalog_model_id {
+            model_state.current_model_id = restored_id;
+        }
         let (session_config_value, session_detail_value) = self
             .session_config_meta(
                 &session_id,
@@ -2009,20 +2199,25 @@ impl acp::Agent for MvpAgent {
             return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
         let latched_model = self
-            .model_unavailable_sessions
+            .model_blocked_sessions
             .borrow()
             .get(arguments.session_id.0.as_ref())
             .cloned();
-        if let Some(unavailable_model) = latched_model {
+        if let Some(block) = latched_model {
             let models = self.models_manager.models();
             let available = self.models_manager.available();
-            let restore_model_id = selectable_catalog_key_for_persisted(
-                    &models,
-                    &available,
-                    &unavailable_model,
-                )
-                .unwrap_or(unavailable_model.clone());
-            if available.contains_key(&restore_model_id) {
+            // Recovery is allowed only when the catalog now answers exactly.
+            // This used to be `selectable_catalog_key_for_persisted`, a
+            // last-wins scan, which meant the very first message after loading
+            // an ambiguous session re-guessed the model — and `apply_resolved`
+            // then wrote that guess down as authoritative identity. Holding the
+            // block is the whole point of having set it.
+            let recovered = crate::agent::models::recover_blocked_model(
+                &models,
+                &available,
+                &block,
+            );
+            if let Some(restore_model_id) = recovered {
                 tracing::info!(
                     session_id = % arguments.session_id.0, model_id = % restore_model_id
                     .0,
@@ -2035,28 +2230,54 @@ impl acp::Agent for MvpAgent {
                         serde_json::json!({ "model_id" : restore_model_id.0.as_ref(), }),
                     ),
                 );
-                self.model_unavailable_sessions
-                    .borrow_mut()
-                    .remove(arguments.session_id.0.as_ref());
-                if let Err(e) = crate::agent::handlers::model_switch::apply(
-                        self,
-                        acp::SetSessionModelRequest::new(
-                            arguments.session_id.clone(),
-                            restore_model_id.clone(),
-                        ),
-                    )
-                    .await
+                // Apply first, release the block last. Anything that fails in
+                // between leaves the block standing and stops the message —
+                // "recovery attempted" is not "recovery succeeded", and a
+                // half-recovered session must not quietly send the user's
+                // message on whatever model it happens to be sitting on.
+                let applied = match self.resolve_model_trusted(restore_model_id.0.as_ref())
                 {
-                    tracing::warn!(
-                        session_id = % arguments.session_id.0, model_id = %
-                        restore_model_id.0, error = ? e,
-                        "prompt: failed to restore previously-unavailable model; continuing with the session's current model"
-                    );
+                    Some(selection) => {
+                        match crate::agent::handlers::model_switch::apply_resolved(
+                                self,
+                                arguments.session_id.clone(),
+                                selection,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(_) => true,
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = % arguments.session_id.0, model_id = %
+                                    restore_model_id.0, error = ? e,
+                                    "prompt: recovery switch failed; keeping the session blocked rather than sending on an unverified model"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            session_id = % arguments.session_id.0, model_id = %
+                            restore_model_id.0,
+                            "prompt: recovered model id no longer maps to exactly one catalog entry; keeping the session blocked"
+                        );
+                        false
+                    }
+                };
+                if crate::agent::models::settle_recovery(
+                    &mut self.model_blocked_sessions.borrow_mut(),
+                    arguments.session_id.0.as_ref(),
+                    applied,
+                ) == crate::agent::models::RecoveryOutcome::Hold
+                {
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
                 }
             } else {
                 tracing::warn!(
-                    session_id = % arguments.session_id.0, unavailable_model = %
-                    unavailable_model.0, available_count = available.len(),
+                    session_id = % arguments.session_id.0, blocked_on = % block
+                    .persisted_id(), available_count = available.len(),
                     available_keys = ? available.keys().take(10).collect::< Vec < _ >>
                     (),
                     "prompt blocked: session model unavailable since load and still missing from the catalog"
@@ -2066,8 +2287,8 @@ impl acp::Agent for MvpAgent {
                     Some(arguments.session_id.0.as_ref()),
                     Some(
                         serde_json::json!(
-                            { "unavailable_model" : unavailable_model.0.as_ref(),
-                            "available_count" : available.len(), }
+                            { "blocked_on" : block.persisted_id(), "available_count"
+                            : available.len(), }
                         ),
                     ),
                 );
@@ -3119,25 +3340,50 @@ impl acp::Agent for MvpAgent {
         &self,
         args: acp::SetSessionModelRequest,
     ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-        let model = self.resolve_model_id(&args.model_id)?;
-        if !model.info.user_selectable {
-            return Err(
-                acp::Error::invalid_params()
-                    .data("This model isn't allowed by your allowed_models setting."),
-            );
-        }
+        // The one **external, user-driven** entry point, so resolution here is
+        // strict: gated on `allowed_models`, and an id that maps to several
+        // entries is refused with its candidates instead of being guessed at.
+        // Everything past this point carries the resolved pair, never the
+        // string the user typed.
+        let models = self.models_manager.models();
+        let selection = match crate::agent::models::resolve_requested_model(
+            &models,
+            &self.models_manager.available(),
+            args.model_id.0.as_ref(),
+        ) {
+            Ok(selection) => selection,
+            Err(crate::agent::models::ModelSelectionError::Unknown(requested)) => {
+                // Configured but not selectable is a different problem from
+                // not configured at all, and only one of them is the user's to
+                // fix in settings — keep the messages distinct.
+                return Err(if self.resolve_model_trusted(&requested).is_some() {
+                    acp::Error::invalid_params()
+                        .data("This model isn't allowed by your allowed_models setting.")
+                } else {
+                    acp::Error::invalid_params().data("unknown model id")
+                });
+            }
+            Err(ambiguous) => return Err(ambiguous.into_acp_error()),
+        };
+        drop(models);
         let session_id = args.session_id.clone();
-        let res = crate::agent::handlers::model_switch::apply(self, args).await;
+        let res = crate::agent::handlers::model_switch::apply_resolved(
+                self,
+                args.session_id,
+                selection,
+                args.meta,
+            )
+            .await;
         if res.is_ok()
             && let Some(unavailable) = self
-                .model_unavailable_sessions
+                .model_blocked_sessions
                 .borrow_mut()
                 .remove(session_id.0.as_ref())
         {
             tracing::info!(
-                session_id = % session_id.0, previously_unavailable_model = % unavailable
-                .0,
-                "set_session_model: user model switch cleared the model-unavailable block"
+                session_id = % session_id.0, previously_blocked_on = % unavailable
+                .persisted_id(),
+                "set_session_model: explicit user model choice cleared the block"
             );
         }
         res

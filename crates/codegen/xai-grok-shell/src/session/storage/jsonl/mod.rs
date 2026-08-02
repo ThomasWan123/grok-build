@@ -695,10 +695,18 @@ impl JsonlStorageAdapter {
         }
         let num_chat_messages = chat_to_copy.len();
         let num_messages = updates_to_copy.len();
-        let target_model_id = options
-            .new_model_id
-            .map(acp::ModelId::new)
-            .unwrap_or(source_summary.current_model_id);
+        // Identity travels as a pair. With no override the fork inherits both
+        // of the source's fields verbatim; with an override the caller — which
+        // is the layer that holds the model catalog — has already resolved it
+        // into (upstream slug, optional catalog key) and passes both here.
+        // This layer never consults the catalog and never invents a key.
+        let (target_model_id, target_catalog_model_id) = match options.new_model_id {
+            None => crate::agent::models::inherited_fork_identity(
+                &source_summary.current_model_id,
+                source_summary.catalog_model_id.as_ref(),
+            ),
+            Some(slug) => (acp::ModelId::new(slug), options.new_catalog_model_id),
+        };
         let target_summary = crate::session::persistence::Summary {
             info: target_info.clone(),
             session_summary: source_summary.session_summary,
@@ -707,6 +715,7 @@ impl JsonlStorageAdapter {
             num_messages,
             num_chat_messages,
             current_model_id: target_model_id,
+            catalog_model_id: target_catalog_model_id,
             parent_session_id: options.parent_session_id,
             forked_at: Some(chrono::Utc::now()),
             collection_id: None,
@@ -885,7 +894,12 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
 }
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
-    async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {
+    async fn init_session_with_catalog(
+        &self,
+        info: &Info,
+        model_id: acp::ModelId,
+        catalog_model_id: Option<acp::ModelId>,
+    ) -> io::Result<Summary> {
         let dir = self.session_dir(info);
         std::fs::create_dir_all(&dir)?;
         let summary_path = self.summary_file(info);
@@ -896,7 +910,7 @@ impl StorageAdapter for JsonlStorageAdapter {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         } else {
             tracing::info!("Creating new session in JSONL");
-            let mut summary = Summary::new(info, model_id)?;
+            let mut summary = Summary::new_for_model(info, model_id, catalog_model_id)?;
             summary.sandbox_profile = xai_grok_sandbox::configured_profile_name().map(String::from);
             self.write_summary_sync(info, &summary)?;
             Ok(summary)
@@ -958,12 +972,14 @@ impl StorageAdapter for JsonlStorageAdapter {
         model_id: &acp::ModelId,
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
+        catalog_model_id: &crate::agent::models::CatalogModelPatch,
     ) -> io::Result<()> {
         self.apply_summary_patch(
             info,
             super::summary_write::SummaryPatch {
                 model: Some(super::summary_write::ModelPatch {
                     model_id: model_id.clone(),
+                    catalog_model_id: catalog_model_id.clone(),
                     agent_name: agent_name.map(String::from),
                     reasoning_effort,
                 }),

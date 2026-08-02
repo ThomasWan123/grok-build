@@ -4804,6 +4804,16 @@ pub fn to_acp_model_info(
                     "agentType".to_string(),
                     serde_json::Value::String(info.agent_type.clone()),
                 );
+                // Host[:port] only — the one column that tells two same-named
+                // models apart. Sanitized by endpoint_authority_label
+                // (credentials/path/query stripped); this string reaches the
+                // client dropdown and logs.
+                map.insert(
+                    "endpointLabel".to_string(),
+                    serde_json::Value::String(
+                        crate::agent::models::endpoint_authority_label(&info.base_url),
+                    ),
+                );
                 if info.supports_reasoning_effort {
                     map.insert(
                         "supportsReasoningEffort".to_string(),

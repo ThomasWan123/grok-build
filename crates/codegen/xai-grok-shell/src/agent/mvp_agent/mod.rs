@@ -55,7 +55,7 @@ use crate::agent::auth_method;
 use crate::agent::config::{self, Config as AgentConfig, ModelEntry, resolve_credentials};
 use crate::agent::feedback_client::FeedbackClient;
 use crate::agent::folder_trust;
-use crate::agent::models::{resolve_catalog_key, selectable_catalog_key_for_persisted};
+use crate::agent::models::resolve_catalog_key;
 use crate::agent::session_config;
 use xai_grok_sampling_types::{
     REASONING_EFFORT_META_KEY, ReasoningEffortOption, reasoning_effort_meta_value,
@@ -211,6 +211,11 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    /// New sessions persist the actor's initial model. Loaded sessions already
+    /// have an authoritative Summary; their actor may temporarily start on a
+    /// fallback while identity restoration is being decided, so writing that
+    /// bootstrap model would corrupt history before the decision completes.
+    pub persist_initial_model: bool,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
@@ -347,6 +352,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         managed_mcp_expires_at: None,
         model_agent_type,
         session_model_id,
+        persist_initial_model: false,
         session_yolo_mode,
         session_auto_mode: false,
         prompt_display_cwd: None,
@@ -773,7 +779,12 @@ pub struct MvpAgent {
     /// fetch still in flight after a leader restart), so the prompt path
     /// re-checks and self-heals — or (b) the user explicitly switches
     /// models via `set_session_model`.
-    model_unavailable_sessions: RefCell<std::collections::HashMap<String, acp::ModelId>>,
+    /// Sessions that cannot prompt yet, and why. Named for the *state*,
+    /// not one of its causes: it also holds ambiguous-identity blocks, and
+    /// reading it as "model temporarily missing" is what let the recovery
+    /// path unblock an ambiguous session by guessing.
+    model_blocked_sessions:
+        RefCell<std::collections::HashMap<String, crate::agent::models::ModelSessionBlock>>,
     /// Unified sender for all subagent coordinator events.
     /// LEADER-SAFE(shared): channel is multi-producer, coordinator drains.
     subagent_event_tx: tokio::sync::mpsc::UnboundedSender<

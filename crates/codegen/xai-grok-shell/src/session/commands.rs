@@ -159,6 +159,13 @@ pub enum SessionCommand {
         responds_to: oneshot::Sender<()>,
     },
     SetSessionModel {
+        /// Catalog key — the stable identity used for persistence and UI.
+        /// Distinct from `sampling_config.model`, which stays the upstream
+        /// routing slug the request carries. Never derive one from the other:
+        /// several entries may share a slug (same model, different proxy).
+        /// Never a guess: an ambiguous request yields `Clear`, not a coin flip
+        /// laundered into authoritative identity.
+        catalog_model_id: crate::agent::models::CatalogModelPatch,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         /// When `false`, skip the system prompt rewrite (concise/default swap).

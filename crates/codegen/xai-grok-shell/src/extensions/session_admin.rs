@@ -718,8 +718,20 @@ async fn handle_commands_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
 
 async fn handle_session_fork(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     use crate::session::fork::{ForkSessionRequest, fork_session};
+    // Resolve the override here, where the catalog exists, so `fork_session`
+    // and the storage layer below it never have to look a model up by string.
 
-    let request: ForkSessionRequest = parse_params(args)?;
+    let mut request: ForkSessionRequest = parse_params(args)?;
+    if let Some(requested) = request.new_model_id.clone() {
+        let (slug, catalog_key) = crate::agent::models::fork_model_override(
+            &agent.models_manager.models(),
+            &agent.models_manager.available(),
+            &requested,
+        )
+        .map_err(|e| e.into_acp_error())?;
+        request.new_model_id = Some(slug.0.to_string());
+        request.new_catalog_model_id = catalog_key;
+    }
 
     let agent_id = agent_id();
     let response = fork_session(request, &agent_id, Some(agent.auth_manager.clone()))

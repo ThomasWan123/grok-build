@@ -45,7 +45,13 @@ impl CounterOp {
 /// value unchanged (matches the legacy `update_current_model` semantics).
 #[derive(Debug, Clone)]
 pub(crate) struct ModelPatch {
+    /// Upstream routing slug (what the API request carries). Kept for
+    /// diagnostics and for reading sessions written before `catalog_model_id`.
     pub model_id: acp::ModelId,
+    /// Catalog key patch. Three states on purpose: for a *model change*,
+    /// "identity unknown" must clear the stored key, not keep it — a stale key
+    /// outliving the model it named wins on restore and lands on the old model.
+    pub catalog_model_id: crate::agent::models::CatalogModelPatch,
     pub agent_name: Option<String>,
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
 }
@@ -131,6 +137,10 @@ impl Summary {
         }
         if let Some(model) = &patch.model {
             self.current_model_id = model.model_id.clone();
+            self.catalog_model_id = crate::agent::models::next_catalog_model_id(
+                self.catalog_model_id.as_ref(),
+                &model.catalog_model_id,
+            );
             if let Some(agent_name) = &model.agent_name {
                 self.agent_name = Some(agent_name.clone());
             }

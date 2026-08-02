@@ -311,7 +311,13 @@ pub enum PersistenceMsg {
     /// Replace the entire chat history (used for compaction)
     ReplaceChatHistory(Vec<ConversationItem>),
     CurrentModel {
+        /// Upstream routing slug (what requests carry).
         model_id: acp::ModelId,
+        /// Catalog key patch. Three states because "identity unknown" and
+        /// "keep what's stored" are different intents: this message means the
+        /// model *changed*, so an unknown identity must `Clear` rather than
+        /// let a stale key outlive the model it named.
+        catalog_model_id: crate::agent::models::CatalogModelPatch,
         /// The active agent definition name (e.g. `"grok-build"`).
         /// Persisted in `summary.agent_name` so session resume doesn't depend
         /// on the mutable model catalog.
@@ -792,7 +798,14 @@ pub struct Summary {
     pub num_messages: usize,
     #[serde(default)]
     pub num_chat_messages: usize,
+    /// Upstream routing slug of the session's model. Sessions written before
+    /// v0.18.6 only have this, which is why it can't double as the identity:
+    /// two catalog entries may share a slug (same model, different proxy).
     pub current_model_id: acp::ModelId,
+    /// Catalog key — the stable model identity. Absent in pre-v0.18.6 sessions;
+    /// those resolve through the slug and migrate on load when unambiguous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_model_id: Option<acp::ModelId>,
     /// Parent session ID if this session was forked from another session
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
@@ -905,6 +918,21 @@ pub fn default_model_id() -> acp::ModelId {
 
 impl Summary {
     pub fn new(info: &Info, model_id: acp::ModelId) -> std::io::Result<Self> {
+        Self::new_for_model(info, model_id, None)
+    }
+
+    /// Construct with both halves of the model identity at once.
+    ///
+    /// The catalog key is a constructor argument, not a follow-up patch,
+    /// because the first serialization of this struct is a durable record: a
+    /// crash between "summary written" and "CurrentModel message applied"
+    /// used to leave a slug-only file on disk, which on a duplicate-slug
+    /// catalog restores into an ambiguity the user already resolved once.
+    pub fn new_for_model(
+        info: &Info,
+        model_id: acp::ModelId,
+        catalog_model_id: Option<acp::ModelId>,
+    ) -> std::io::Result<Self> {
         let git_metadata =
             xai_grok_workspace::session::git::resolve_persisted_session_git_metadata_sync(
                 std::path::Path::new(&info.cwd),
@@ -917,6 +945,7 @@ impl Summary {
             num_messages: 0,
             num_chat_messages: 0,
             current_model_id: model_id,
+            catalog_model_id,
             parent_session_id: None,
             forked_at: None,
             collection_id: None,
@@ -1602,6 +1631,7 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::CurrentModel {
                     model_id,
+                    catalog_model_id,
                     agent_name,
                     reasoning_effort,
                 } => {
@@ -1612,6 +1642,7 @@ impl SessionPersistence {
                             &model_id,
                             agent_name.as_deref(),
                             reasoning_effort,
+                            &catalog_model_id,
                         )
                         .await
                     {
@@ -2060,6 +2091,7 @@ const WORKTREE_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 pub(crate) async fn new(
     info: &Info,
     model_id: acp::ModelId,
+    catalog_model_id: Option<acp::ModelId>,
     sampling_client: OaiCompatClient,
     storage_mode: StorageMode,
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
@@ -2072,7 +2104,9 @@ pub(crate) async fn new(
     let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
 
     // Initialize session in storage
-    let mut summary = storage.init_session(info, model_id.clone()).await?;
+    let mut summary = storage
+        .init_session_with_catalog(info, model_id.clone(), catalog_model_id)
+        .await?;
     touch_worktree_for_session(info).await;
 
     // Update model if different
@@ -2130,6 +2164,7 @@ pub async fn new_with_explicit_dir(
     info: &Info,
     target_dir: PathBuf,
     model_id: acp::ModelId,
+    catalog_model_id: Option<acp::ModelId>,
     sampling_client: OaiCompatClient,
     session_summary_model: String,
 ) -> io::Result<PersistenceHandle> {
@@ -2138,7 +2173,9 @@ pub async fn new_with_explicit_dir(
         Box::new(JsonlStorageAdapter::with_explicit_session_dir(target_dir));
 
     // Initialize session in storage (creates summary.json, etc.)
-    let mut summary = storage.init_session(info, model_id.clone()).await?;
+    let mut summary = storage
+        .init_session_with_catalog(info, model_id.clone(), catalog_model_id)
+        .await?;
     touch_worktree_for_session(info).await;
     if summary.session_kind.is_none() {
         summary.session_kind = Some("subagent".to_string());

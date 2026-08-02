@@ -122,6 +122,8 @@ pub(crate) mod hydrate {
             num_messages,
             num_chat_messages,
             current_model_id: model_id,
+            // 远端拉取的会话没有本地 catalog 概念，留空由加载期迁移。
+            catalog_model_id: None,
             parent_session_id,
             forked_at: None,
             collection_id: None,

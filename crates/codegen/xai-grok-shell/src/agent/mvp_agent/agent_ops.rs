@@ -1081,6 +1081,17 @@ impl MvpAgent {
         );
         Ok(entry.clone())
     }
+    /// Resolve an id for an **internal, trusted** caller (session creation,
+    /// history restore, unavailable-model recovery): no `allowed_models` gate,
+    /// so hidden models keep working, but still exact — `None` rather than a
+    /// guess when the id maps to several entries. Returns the catalog key and
+    /// the entry together so neither has to be re-derived downstream.
+    pub(crate) fn resolve_model_trusted(
+        &self,
+        requested: &str,
+    ) -> Option<crate::agent::models::ResolvedModelSelection> {
+        crate::agent::models::resolve_trusted_model(&self.models_manager.models(), requested)
+    }
     pub(crate) fn prepare_sampling_config_for_model(
         &self,
         model: &ModelEntry,
@@ -1534,7 +1545,7 @@ impl MvpAgent {
                     crate::session::mcp_servers::McpState::new(vec![]),
                 ),
             ),
-            model_unavailable_sessions: RefCell::new(std::collections::HashMap::new()),
+            model_blocked_sessions: RefCell::new(std::collections::HashMap::new()),
             subagent_event_tx,
             subagent_event_rx: RefCell::new(Some(subagent_event_rx)),
             subagent_coordinator: RefCell::new(subagent_coordinator),
@@ -2879,6 +2890,7 @@ impl MvpAgent {
             managed_mcp_expires_at,
             model_agent_type,
             session_model_id,
+            persist_initial_model,
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
@@ -3474,13 +3486,40 @@ impl MvpAgent {
             let initial_reasoning_effort = chat_history
                 .is_empty()
                 .then_some(sampling_config.reasoning_effort);
-            let _ = persistence
-                .tx
-                .send(crate::session::persistence::PersistenceMsg::CurrentModel {
-                    model_id: session_model_id.clone(),
-                    agent_name: Some(agent_definition.name.clone()),
-                    reasoning_effort: initial_reasoning_effort,
-                });
+            // `session_model_id` is the runtime/catalog identity, while
+            // `sampling_config.model` is the upstream slug. Persisting the
+            // former into `current_model_id` overwrote the correct atomic
+            // first write performed by `new_session` and cleared its catalog
+            // key. Resolve both halves from one catalog snapshot and verify
+            // that the selected entry is the one that produced this sampling
+            // config before writing either field.
+            if persist_initial_model {
+                let models = self.models_manager.models();
+                let catalog_model_id =
+                    crate::agent::models::resolve_trusted_model(
+                        &models,
+                        session_model_id.0.as_ref(),
+                    )
+                    .filter(|selection| {
+                        selection.entry().info.model == sampling_config.model
+                    })
+                    .map_or(
+                        crate::agent::models::CatalogModelPatch::Clear,
+                        |selection| {
+                            crate::agent::models::CatalogModelPatch::Set(
+                                selection.catalog_key().clone(),
+                            )
+                        },
+                    );
+                let _ = persistence
+                    .tx
+                    .send(crate::session::persistence::PersistenceMsg::CurrentModel {
+                        model_id: acp::ModelId::new(sampling_config.model.clone()),
+                        catalog_model_id,
+                        agent_name: Some(agent_definition.name.clone()),
+                        reasoning_effort: initial_reasoning_effort,
+                    });
+            }
             let acp_mcp_servers = crate::session::acp_mcp::parse_acp_mcp_servers(
                 session_meta,
             );

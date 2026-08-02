@@ -181,6 +181,10 @@ siphasher = { workspace = true }
 windows = { workspace = true }
 
 [dev-dependencies]
+# Gate 1 (tests/model_endpoint_routing.rs): two axum mock endpoints prove a
+# model selection reaches its own endpoint with its own key.
+axum = { workspace = true }
+futures-util = { workspace = true }
 criterion = { workspace = true }
 filetime = { workspace = true }
 tempfile = { workspace = true }

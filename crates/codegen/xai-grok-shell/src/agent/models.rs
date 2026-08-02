@@ -1628,25 +1628,641 @@ pub(crate) fn resolve_catalog_key(
         .map(|(key, _)| acp::ModelId::new(key.clone()))
 }
 
-/// Catalog key for a persisted session model id, restricted to **selectable**
-/// entries. A selectable exact-key match wins (as in [`resolve_catalog_key`]);
-/// otherwise the last selectable entry whose routing slug matches `id`, so a
-/// non-selectable exact-key entry never shadows a selectable slug match.
-pub(crate) fn selectable_catalog_key_for_persisted(
+/// One selectable catalog entry offered to the user when a legacy persisted
+/// slug is ambiguous. `endpoint_label` is the **host only** — never the full
+/// URL, query string, or any credential.
+/// camelCase on the wire: this type is serialized straight into
+/// `LoadSessionResponse.meta` and read by the client, so it has to match the
+/// shape the client already uses for the same payload coming back through the
+/// `setModel` error path. Getting this wrong is silent — the picker still
+/// opens, just with an empty endpoint column, which is the one column that
+/// tells the user which of two same-named models they are choosing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCandidate {
+    /// Catalog key — the stable identity that must be persisted.
+    pub id: String,
+    /// Display name (falls back to the routing slug).
+    pub name: String,
+    /// Host of `base_url`, e.g. `open.bigmodel.cn`.
+    pub endpoint_label: String,
+    /// Whether `allowed_models` lets the user pick this one. Selectability
+    /// governs what the client *offers*, never whether the ambiguity exists —
+    /// dropping a non-selectable match from the count would silently promote
+    /// the remaining one, which is exactly the guess this type exists to
+    /// prevent.
+    pub selectable: bool,
+}
+
+/// Outcome of resolving a persisted session model back to a catalog entry.
+///
+/// The identity split this encodes:
+/// - `catalog_model_id` — config key, the only stable identity;
+/// - `legacy_model_id` — the upstream routing slug older sessions persisted
+///   (and which newer sessions still keep for diagnostics).
+///
+/// Duplicate slugs across entries (same model reached through different
+/// proxies) are legitimate, so a slug alone may not identify an entry. When it
+/// doesn't, this never guesses — it reports the candidates and lets the user
+/// choose. That guess is exactly what routed a restored session to the wrong
+/// endpoint before (a `.rev()` last-wins scan in the since-deleted
+/// `selectable_catalog_key_for_persisted`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistedModelResolution {
+    /// `catalog_model_id` was present and still selectable — restore verbatim.
+    Exact(acp::ModelId),
+    /// No usable catalog key, but the legacy slug matched exactly one
+    /// selectable entry. Caller restores it and writes the key back.
+    Migrated(acp::ModelId),
+    /// The legacy slug matches several selectable entries. Load the history,
+    /// pause sending, and ask the user which entry this session meant.
+    Ambiguous {
+        legacy_model: String,
+        candidates: Vec<ModelCandidate>,
+    },
+    /// Nothing in the catalog matches.
+    NotFound,
+}
+
+/// Display label for a base URL: **authority only** (`host[:port]`, so
+/// `localhost:9999` stays distinguishable), with userinfo stripped and path,
+/// query and fragment dropped. Credentials embedded in a URL
+/// (`https://user:pass@host/…`) must never reach the UI.
+pub fn endpoint_authority_label(base_url: &str) -> String {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
+        .to_owned()
+}
+
+/// Resolve a persisted session model to a catalog key. See
+/// [`PersistedModelResolution`] for the rules.
+///
+/// Order matters: the catalog key is consulted first, and the legacy slug is
+/// only ever a *unique*-match fallback. Notably the slug is **not** looked up
+/// as a catalog key before the duplicate scan — doing so would let an entry
+/// literally keyed `glm-4.6` silently win over a same-slug proxy entry, which
+/// is the ambiguity this function exists to surface.
+pub fn resolve_persisted_model(
     models: &IndexMap<String, ModelEntry>,
     available: &IndexMap<acp::ModelId, acp::ModelInfo>,
-    id: &acp::ModelId,
+    catalog_model_id: Option<&str>,
+    legacy_model_id: &str,
+) -> PersistedModelResolution {
+    // Exact identity is honored unconditionally — `available` is the
+    // *user-selectable* set, and restoring a session is not a user selection.
+    // Gating this on selectability would fail to restore internal/hidden
+    // models that hold a perfectly accurate catalog key (the same mistake
+    // `catalog_patch_for_ungated_switch` had to be corrected for).
+    if let Some(key) = catalog_model_id {
+        if models.contains_key(key) {
+            return PersistedModelResolution::Exact(acp::ModelId::new(key.to_owned()));
+        }
+    }
+    // No exact key: fall back to the legacy slug. Matches are counted across
+    // the **whole catalog**, not the selectable subset. Selectability decides
+    // what the client offers, never whether the ambiguity exists — filtering a
+    // hidden twin out of the count would leave one match standing and migrate
+    // to it silently, which is a guess wearing the costume of a unique answer.
+    // Callers render `ModelCandidate::selectable` instead.
+    let matches: Vec<(&String, &ModelEntry)> = models
+        .iter()
+        .filter(|(_, entry)| entry.info.model == legacy_model_id)
+        .collect();
+    match matches.len() {
+        // No slug match anywhere: the record may predate slugs being written
+        // and already hold a catalog key. Accepting it is exact, not a guess —
+        // there is nothing for it to be ambiguous with.
+        0 => {
+            if models.contains_key(legacy_model_id) {
+                PersistedModelResolution::Migrated(acp::ModelId::new(legacy_model_id.to_owned()))
+            } else {
+                PersistedModelResolution::NotFound
+            }
+        }
+        // Unique across the whole catalog — including when that one entry is
+        // hidden, which is how a legacy internal-model session recovers.
+        1 => PersistedModelResolution::Migrated(acp::ModelId::new(matches[0].0.clone())),
+        _ => PersistedModelResolution::Ambiguous {
+            legacy_model: legacy_model_id.to_owned(),
+            candidates: matches
+                .iter()
+                .map(|(key, entry)| ModelCandidate {
+                    id: (*key).clone(),
+                    name: entry
+                        .info
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| entry.info.model.clone()),
+                    endpoint_label: endpoint_authority_label(&entry.info.base_url),
+                    selectable: available.contains_key(&acp::ModelId::new((*key).clone())),
+                })
+                .collect(),
+        },
+    }
+}
+
+/// Why a session cannot prompt yet. The two reasons are kept apart because
+/// they were once the same untyped map entry, and sharing it meant an
+/// *ambiguous* session was auto-recovered by the *unavailable* path — with the
+/// old last-wins scan, so the first message re-guessed the model and had that
+/// guess written back as authoritative identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSessionBlock {
+    /// The model this session ran on is gone from the catalog.
+    Unavailable { persisted_model: acp::ModelId },
+    /// The persisted id maps to several entries; only the user can say which.
+    Ambiguous {
+        requested: String,
+        candidates: Vec<ModelCandidate>,
+    },
+}
+
+impl ModelSessionBlock {
+    /// The id to re-check the catalog with.
+    pub fn persisted_id(&self) -> &str {
+        match self {
+            Self::Unavailable { persisted_model } => persisted_model.0.as_ref(),
+            Self::Ambiguous { requested, .. } => requested.as_str(),
+        }
+    }
+}
+
+/// Can a blocked session be released without asking the user?
+///
+/// Both block kinds run the same check, which is the point: recovery is
+/// allowed only when the catalog now answers the question *exactly* — a slug
+/// unique across the whole catalog, resolving to a model that is usable right
+/// now. Anything else keeps the block. Notably an ambiguous session is not
+/// special-cased into permanent limbo either: if the duplicate entry is
+/// removed from config, the id becomes unique and the session simply resumes.
+pub fn recover_blocked_model(
+    models: &IndexMap<String, ModelEntry>,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+    block: &ModelSessionBlock,
 ) -> Option<acp::ModelId> {
-    if available.contains_key(id) {
-        return Some(id.clone());
+    let resolved = match resolve_persisted_model(models, available, None, block.persisted_id()) {
+        PersistedModelResolution::Exact(id) | PersistedModelResolution::Migrated(id) => id,
+        // Still ambiguous, or still gone. Either way there is nothing to
+        // recover to that is not a guess.
+        PersistedModelResolution::Ambiguous { .. } | PersistedModelResolution::NotFound => {
+            return None;
+        }
+    };
+    available.contains_key(&resolved).then_some(resolved)
+}
+
+/// Strict, catalog-wide resolution for a subagent's **explicit** model
+/// override (`[subagents.models]` pin / `AgentDefinition.model` / runtime
+/// override / resume pin).
+///
+/// Ungated on `available` — subagents legitimately run hidden models — but
+/// strict on identity: an exact config key wins; a slug unique across the
+/// whole catalog normalizes to its key; a duplicate slug is an error the
+/// caller must surface, NOT a first-match guess. The pre-review code guessed
+/// here (`find_model_by_id` first-match), which meant a `[subagents.models]
+/// explore = "glm-4.6"` pin silently routed to whichever entry came first in
+/// the catalog — the request went to a guessed endpoint before persistence
+/// ever got a say. Refusing to spawn is recoverable; a request sent to the
+/// wrong provider is not.
+pub fn resolve_override_ungated(
+    models: &IndexMap<String, ModelEntry>,
+    requested: &str,
+) -> Result<ResolvedModelSelection, ModelSelectionError> {
+    if let Some(entry) = models.get(requested) {
+        return Ok(ResolvedModelSelection {
+            catalog_key: acp::ModelId::new(requested.to_owned()),
+            entry: entry.clone(),
+        });
     }
-    let id_str = id.0.as_ref();
-    if let Some((key, _)) = models.iter().rev().find(|(key, entry)| {
-        available.contains_key(&acp::ModelId::new((*key).clone())) && entry.info.model == id_str
-    }) {
-        return Some(acp::ModelId::new(key.clone()));
+    let matches: Vec<(&String, &ModelEntry)> = models
+        .iter()
+        .filter(|(_, e)| e.info.model == requested)
+        .collect();
+    match matches.len() {
+        0 => Err(ModelSelectionError::Unknown(requested.to_owned())),
+        1 => Ok(ResolvedModelSelection {
+            catalog_key: acp::ModelId::new(matches[0].0.clone()),
+            entry: matches[0].1.clone(),
+        }),
+        _ => Err(ModelSelectionError::Ambiguous {
+            requested: requested.to_owned(),
+            candidates: matches
+                .iter()
+                .map(|(key, entry)| ModelCandidate {
+                    id: (*key).clone(),
+                    name: entry
+                        .info
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| entry.info.model.clone()),
+                    endpoint_label: endpoint_authority_label(&entry.info.base_url),
+                    selectable: entry.info.user_selectable,
+                })
+                .collect(),
+        }),
     }
-    resolve_catalog_key(models, id).filter(|key| available.contains_key(key))
+}
+
+/// The identity pair for a subagent session's first Summary write.
+///
+/// Invariant (Codex, v0.18.7-A): persist the canonical catalog key of the
+/// model the child **actually uses** — the parent's key only when the child
+/// genuinely inherits the parent's model, never as a default. Recording the
+/// parent's key while the child runs something else would be a brand-new
+/// mismatch, not inheritance.
+///
+/// Inputs are the pair the spawn path already holds: `effective_model_id`
+/// (the parent handle's canonical key on the inherit path; the exact key or
+/// the bare slug on the override path) and the sampling config's model — the
+/// name that will actually go over the wire. No `available` gating: subagents
+/// legitimately run hidden models, and this function records fact, not choice.
+///
+/// A duplicate slug writes no key. Explicit overrides can no longer reach
+/// here ambiguous — `resolve_override_ungated` rejects them before spawn — so
+/// this branch covers residual paths only (e.g. a parent-fallback whose
+/// sampling model happens to be a duplicated slug). Re-deriving a winner from
+/// strings would be the second lookup this effort forbids; empty is
+/// recoverable (restore asks the user), a laundered guess is not.
+pub fn subagent_persisted_identity(
+    models: &IndexMap<String, ModelEntry>,
+    effective_model_id: &acp::ModelId,
+    sampling_model: &str,
+) -> (acp::ModelId, Option<acp::ModelId>) {
+    let current = acp::ModelId::new(sampling_model.to_owned());
+    if let Some(entry) = models.get(effective_model_id.0.as_ref()) {
+        if entry.info.model == sampling_model {
+            return (current, Some(effective_model_id.clone()));
+        }
+        return (current, None);
+    }
+    let mut matches = models.iter().filter(|(_, e)| e.info.model == sampling_model);
+    match (matches.next(), matches.next()) {
+        (Some((key, _)), None) if effective_model_id.0.as_ref() == sampling_model => {
+            (current, Some(acp::ModelId::new(key.clone())))
+        }
+        _ => (current, None),
+    }
+}
+
+/// The identity a fork inherits when the caller supplies no model override.
+///
+/// Both fields are carried over verbatim. The source session already settled
+/// which catalog entry it runs on — dropping its key would hand the child an
+/// ambiguity its parent had resolved, and on a duplicate-slug catalog the user
+/// gets asked to re-pick a model they chose once already.
+pub fn inherited_fork_identity(
+    source_current: &acp::ModelId,
+    source_catalog: Option<&acp::ModelId>,
+) -> (acp::ModelId, Option<acp::ModelId>) {
+    (source_current.clone(), source_catalog.cloned())
+}
+
+/// The identity a fork gets when the caller **does** supply an override.
+///
+/// An explicit override is user input, so it gets the same strict, gated
+/// treatment as `setModel` and fails rather than degrading.
+///
+/// Letting an unresolvable override through as a bare literal — the earlier
+/// behavior, chosen to keep fork from ever hard-failing — opened a way around
+/// `allowed_models`: restore is deliberately ungated (a hidden model holding
+/// an exact key must be able to come back), so a literal written here was
+/// later honored as identity. The two are only safe together if the gate is
+/// enforced at the point the string enters.
+pub fn fork_model_override(
+    models: &IndexMap<String, ModelEntry>,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+    requested: &str,
+) -> Result<(acp::ModelId, Option<acp::ModelId>), ModelSelectionError> {
+    let selection = resolve_requested_model(models, available, requested)?;
+    let slug = acp::ModelId::new(selection.entry().info.model.clone());
+    Ok((slug, Some(selection.catalog_key().clone())))
+}
+
+/// The identity pair for a brand-new session's **first** Summary write.
+///
+/// Field semantics are the whole point (and were once violated by writing the
+/// catalog key into both): `current_model_id` is the *upstream slug* — the
+/// name actually sent over the wire, read by legacy loaders, sync peers, and
+/// anything else that predates `catalog_model_id` — while the key goes only
+/// into `catalog_model_id`. The slug comes from the sampling config because
+/// that is literally what the session is about to send; the key is written
+/// only when the catalog knows the runtime id exactly (an exact lookup, not a
+/// guess — for a custom model the runtime id *is* the strictly-resolved key).
+pub fn initial_persisted_identity(
+    models: &IndexMap<String, ModelEntry>,
+    runtime_model_id: &acp::ModelId,
+    sampling_model: &str,
+) -> (acp::ModelId, Option<acp::ModelId>) {
+    let current = acp::ModelId::new(sampling_model.to_owned());
+    // Fail closed on the pair, not just the key: the key is written only when
+    // its entry's slug is the slug actually being persisted alongside it.
+    // A bare `contains_key` would happily record "A's key with B's model" —
+    // the exact mismatch this whole effort exists to rule out — whenever a
+    // catalog hot-reload races session creation or a future caller passes an
+    // inconsistent pair. An identity we cannot vouch for is left empty.
+    let catalog = models
+        .get(runtime_model_id.0.as_ref())
+        .filter(|entry| entry.info.model == sampling_model)
+        .map(|_| runtime_model_id.clone());
+    (current, catalog)
+}
+
+/// What the prompt handler should do after attempting a recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    /// The model switch landed; the block is gone and the message may go out.
+    Continue,
+    /// Something failed. The block stands and the message must not be sent.
+    Hold,
+}
+
+/// Commit or abandon a recovery attempt, in that order.
+///
+/// The block is released **only** once the switch has actually applied. The
+/// earlier code removed it first and merely logged a warning if the switch
+/// then failed — so a session whose recovery blew up went on to send the
+/// user's message on whatever model it happened to be sitting on, with nothing
+/// left to stop it next time either.
+pub fn settle_recovery(
+    blocks: &mut std::collections::HashMap<String, ModelSessionBlock>,
+    session_id: &str,
+    applied: bool,
+) -> RecoveryOutcome {
+    if !applied {
+        return RecoveryOutcome::Hold;
+    }
+    blocks.remove(session_id);
+    RecoveryOutcome::Continue
+}
+
+/// A model the user asked for, resolved once into both halves of its identity.
+/// Returning them together stops the old two-step (`resolve_model_id` for the
+/// entry, then a second lookup for the key) from drifting apart again.
+///
+/// The fields are private on purpose. Public fields would let any caller
+/// hand-assemble one entry's key with another entry's endpoint — the exact
+/// mismatch this type exists to rule out — so the only way to obtain one is
+/// through a resolver in this module.
+#[derive(Debug, Clone)]
+pub struct ResolvedModelSelection {
+    catalog_key: acp::ModelId,
+    entry: ModelEntry,
+}
+
+impl ResolvedModelSelection {
+    /// Catalog key — persist this, show this, switch on this.
+    pub fn catalog_key(&self) -> &acp::ModelId {
+        &self.catalog_key
+    }
+
+    /// The entry itself; `info().model` is the upstream slug the request
+    /// carries and `info().base_url` its endpoint.
+    pub fn entry(&self) -> &ModelEntry {
+        &self.entry
+    }
+
+    /// Consume into both halves at once. Taking them together keeps them
+    /// together — there is no way to take one and look the other up again.
+    pub fn into_parts(self) -> (acp::ModelId, ModelEntry) {
+        (self.catalog_key, self.entry)
+    }
+}
+
+/// Why a requested model id could not be resolved to exactly one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSelectionError {
+    /// The id is a routing slug shared by several entries. Ask the user.
+    Ambiguous {
+        requested: String,
+        candidates: Vec<ModelCandidate>,
+    },
+    /// Nothing in the catalog matches.
+    Unknown(String),
+}
+
+/// Stable machine-readable code for "this id maps to more than one entry".
+/// Clients key their disambiguation UI off this — it must never be reused for
+/// the merely-unknown case, or the UI opens a picker with no candidates.
+pub const MODEL_AMBIGUOUS: &str = "ambiguous_model_id";
+
+/// Structured payload for an ambiguous model id, serialized into
+/// `acp::Error.data`.
+///
+/// This is deliberately structured rather than a prose message: the client
+/// needs the candidate list to load the session read-only, hold sending, and
+/// ask the user which entry they meant. A message string only affords an
+/// alert. Candidates carry `endpoint_label` (host only) because the endpoint
+/// is precisely what distinguishes two entries sharing one routing slug.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmbiguousModelError {
+    /// Always [`MODEL_AMBIGUOUS`].
+    pub code: String,
+    /// The id the caller asked for.
+    pub requested: String,
+    /// Every catalog entry it could mean, in catalog order.
+    pub candidates: Vec<ModelCandidate>,
+    /// Remediation hint for the client.
+    pub suggestion: String,
+}
+
+impl AmbiguousModelError {
+    pub fn new(requested: String, candidates: Vec<ModelCandidate>) -> Self {
+        Self {
+            code: MODEL_AMBIGUOUS.to_owned(),
+            requested,
+            candidates,
+            suggestion: "choose_model".to_owned(),
+        }
+    }
+
+    pub fn into_acp_error(self) -> acp::Error {
+        let listed = self
+            .candidates
+            .iter()
+            .map(|c| format!("{} ({})", c.id, c.endpoint_label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "'{}' matches more than one configured model: {listed}. \
+             Pick the one you meant.",
+            self.requested,
+        );
+        acp::Error::new(acp::ErrorCode::InvalidParams.into(), message)
+            .data(serde_json::to_value(&self).ok())
+    }
+
+    /// Parse back from `acp::Error.data`; `None` for any other error.
+    pub fn from_acp_error(err: &acp::Error) -> Option<Self> {
+        let data = err.data.as_ref()?;
+        if data.get("code")?.as_str()? != MODEL_AMBIGUOUS {
+            return None;
+        }
+        serde_json::from_value(data.clone()).ok()
+    }
+}
+
+impl ModelSelectionError {
+    /// Render as an `acp::Error`, keeping the two failure kinds distinct:
+    /// ambiguity carries candidates, unknown carries none.
+    pub fn into_acp_error(self) -> acp::Error {
+        match self {
+            Self::Ambiguous {
+                requested,
+                candidates,
+            } => AmbiguousModelError::new(requested, candidates).into_acp_error(),
+            Self::Unknown(requested) => acp::Error::invalid_params()
+                .data(format!("unknown model id: {requested}")),
+        }
+    }
+}
+
+/// Strict resolution for **user-driven** model selection (ACP `setModel`).
+///
+/// Unlike [`resolve_catalog_key`], which picks the last match when a slug is
+/// duplicated, this refuses to guess. That matters because the resolved key is
+/// now persisted as `catalog_model_id`: a `.rev()` guess here would launder a
+/// coin flip into authoritative identity, which is worse than the ambiguity it
+/// papered over. Legacy clients sending a slug still work — as long as the slug
+/// identifies exactly one entry.
+pub fn resolve_requested_model(
+    models: &IndexMap<String, ModelEntry>,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+    requested: &str,
+) -> Result<ResolvedModelSelection, ModelSelectionError> {
+    let exact = acp::ModelId::new(requested.to_owned());
+    if available.contains_key(&exact)
+        && let Some(entry) = models.get(requested)
+    {
+        return Ok(ResolvedModelSelection {
+            catalog_key: exact,
+            entry: entry.clone(),
+        });
+    }
+    let matches: Vec<(&String, &ModelEntry)> = models
+        .iter()
+        .filter(|(key, entry)| {
+            entry.info.model == requested
+                && available.contains_key(&acp::ModelId::new((*key).clone()))
+        })
+        .collect();
+    match matches.len() {
+        0 => Err(ModelSelectionError::Unknown(requested.to_owned())),
+        1 => Ok(ResolvedModelSelection {
+            catalog_key: acp::ModelId::new(matches[0].0.clone()),
+            entry: matches[0].1.clone(),
+        }),
+        _ => Err(ModelSelectionError::Ambiguous {
+            requested: requested.to_owned(),
+            candidates: matches
+                .iter()
+                .map(|(key, entry)| ModelCandidate {
+                    id: (*key).clone(),
+                    name: entry
+                        .info
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| entry.info.model.clone()),
+                    endpoint_label: endpoint_authority_label(&entry.info.base_url),
+                    // This path already filtered on `available`, so every
+                    // candidate here is one the user can actually pick.
+                    selectable: true,
+                })
+                .collect(),
+        }),
+    }
+}
+
+/// How a summary write should treat the persisted catalog key.
+///
+/// Three states, not `Option`: "I don't know the key" and "keep whatever is
+/// there" are different intents, and conflating them lets a model *change*
+/// keep a stale identity — slug moves, key doesn't, and the next restore
+/// prefers the key and lands on the old model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogModelPatch {
+    /// Leave the stored key alone (metadata-only writes).
+    Preserve,
+    /// Set it.
+    Set(acp::ModelId),
+    /// The model changed but its key is unknown — drop the stale identity
+    /// rather than let it outlive the model it named.
+    Clear,
+}
+
+/// Which identity a model switch should persist for `requested`, on the
+/// **ungated** shared path.
+///
+/// Two rules, and they pull in opposite directions:
+/// - never persist a guess — a coin-flipped key written to `catalog_model_id`
+///   launders ambiguity into authority, worse than the ambiguity it hides
+///   (a cleared key falls back to slug resolution, which asks the user);
+/// - never erase a *known* identity — including one the user can't pick from
+///   the model menu.
+///
+/// Hence no `available` filter here: this serves `apply`, which internal
+/// callers use with hidden / non-user-selectable models. Filtering by
+/// selectability would let an exact hidden key resolve to "unknown" and wipe a
+/// perfectly accurate identity. Strict *selection* (which does gate on
+/// selectability) stays in [`resolve_requested_model`], for the external
+/// user-driven path only — the two responsibilities must not be merged.
+pub fn catalog_patch_for_ungated_switch(
+    models: &IndexMap<String, ModelEntry>,
+    requested: &str,
+) -> CatalogModelPatch {
+    match resolve_trusted_model(models, requested) {
+        Some(sel) => CatalogModelPatch::Set(sel.catalog_key),
+        None => CatalogModelPatch::Clear,
+    }
+}
+
+/// Resolution for **internal, already-trusted** callers — session creation,
+/// history restore, recovering a model that came back into the catalog.
+///
+/// No `available` filter: these are not user selections, so gating them on
+/// what the model menu offers would break hidden / non-user-selectable models
+/// (see [`catalog_patch_for_ungated_switch`]). Still exact, never a guess:
+/// an id that maps to several entries yields `None` rather than a coin flip.
+///
+/// Returns both halves of the identity together so no caller downstream has to
+/// go back to a string and re-derive either one.
+pub fn resolve_trusted_model(
+    models: &IndexMap<String, ModelEntry>,
+    requested: &str,
+) -> Option<ResolvedModelSelection> {
+    if let Some(entry) = models.get(requested) {
+        return Some(ResolvedModelSelection {
+            catalog_key: acp::ModelId::new(requested.to_owned()),
+            entry: entry.clone(),
+        });
+    }
+    let mut slug_matches = models.iter().filter(|(_, e)| e.info.model == requested);
+    match (slug_matches.next(), slug_matches.next()) {
+        (Some((key, entry)), None) => Some(ResolvedModelSelection {
+            catalog_key: acp::ModelId::new(key.clone()),
+            entry: entry.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Apply a [`CatalogModelPatch`] to the currently stored key.
+pub fn next_catalog_model_id(
+    existing: Option<&acp::ModelId>,
+    patch: &CatalogModelPatch,
+) -> Option<acp::ModelId> {
+    match patch {
+        CatalogModelPatch::Preserve => existing.cloned(),
+        CatalogModelPatch::Set(id) => Some(id.clone()),
+        CatalogModelPatch::Clear => None,
+    }
 }
 
 /// A "campaign-only" preferred flip: the default changed and either side's value
@@ -3515,77 +4131,6 @@ mod tests {
         let persisted = acp::ModelId::new("grok-4.5");
         let key = resolve_catalog_key(&models, &persisted).expect("slug must resolve");
         assert_eq!(key.0.as_ref(), "user-grok-build");
-    }
-
-    #[test]
-    fn selectable_catalog_key_for_persisted_none_when_resolved_not_available() {
-        let mut models = IndexMap::new();
-        models.insert(
-            "enterprise-grok-build".to_string(),
-            make_model_entry("grok-4.5"),
-        );
-
-        let available: IndexMap<_, _> = IndexMap::new();
-        let persisted = acp::ModelId::new("grok-4.5");
-        assert!(selectable_catalog_key_for_persisted(&models, &available, &persisted).is_none());
-    }
-
-    #[test]
-    fn selectable_prefers_available_identity_over_non_selectable_exact_key() {
-        let mut models = IndexMap::new();
-        models.insert("grok-build".to_string(), make_model_entry("grok-build"));
-        models.insert(
-            "enterprise-grok-build".to_string(),
-            make_model_entry("grok-build"),
-        );
-        models.insert("grok-4.3".to_string(), make_model_entry("grok-4.3"));
-
-        let available = test_available_keys(&["enterprise-grok-build", "grok-4.3"]);
-
-        let persisted = acp::ModelId::new("grok-build");
-        assert_eq!(
-            resolve_catalog_key(&models, &persisted)
-                .expect("exact key exists")
-                .0
-                .as_ref(),
-            "grok-build"
-        );
-        let key = selectable_catalog_key_for_persisted(&models, &available, &persisted)
-            .expect("must resolve to selectable section");
-        assert_eq!(key.0.as_ref(), "enterprise-grok-build");
-    }
-
-    #[test]
-    fn selectable_matches_routing_slug_when_no_exact_key() {
-        let mut models = IndexMap::new();
-        models.insert(
-            "enterprise-grok-build".to_string(),
-            make_model_entry("grok-build"),
-        );
-        models.insert("grok-4.3".to_string(), make_model_entry("grok-4.3"));
-
-        let available = test_available_keys(&["enterprise-grok-build", "grok-4.3"]);
-
-        let persisted = acp::ModelId::new("grok-build");
-        let key = selectable_catalog_key_for_persisted(&models, &available, &persisted)
-            .expect("slug must resolve to selectable key");
-        assert_eq!(key.0.as_ref(), "enterprise-grok-build");
-    }
-
-    /// A persisted *selectable* catalog key binds to itself even when a later
-    /// selectable section's routing slug equals that key (exact key wins).
-    #[test]
-    fn selectable_prefers_exact_key_over_later_slug_match() {
-        let mut models = IndexMap::new();
-        models.insert("grok-build".to_string(), make_model_entry("grok-4.5"));
-        models.insert("other".to_string(), make_model_entry("grok-build"));
-
-        let available = test_available_keys(&["grok-build", "other"]);
-
-        let persisted = acp::ModelId::new("grok-build");
-        let key = selectable_catalog_key_for_persisted(&models, &available, &persisted)
-            .expect("exact selectable key must win");
-        assert_eq!(key.0.as_ref(), "grok-build");
     }
 
     fn test_available_keys(keys: &[&str]) -> IndexMap<acp::ModelId, acp::ModelInfo> {

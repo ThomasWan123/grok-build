@@ -420,13 +420,23 @@ pub(crate) async fn handle_subagent_request(
     if request.fork_context {
         effective_runtime.model = Some(ctx.model_id.0.to_string());
     }
-    let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
+    let (mut effective_sampling_config, mut effective_model_id) =
+        match resolve_effective_model_config(
             effective_runtime.model.as_deref(),
             &request.subagent_type,
             &definition.model,
             &ctx,
         )
-        .await;
+        .await
+        {
+            Ok(resolved) => resolved,
+            // Ambiguous explicit override: refuse to spawn. Zero requests go
+            // out — a guessed endpoint cannot be un-requested afterwards.
+            Err(msg) => {
+                send_failure(request, &msg);
+                return;
+            }
+        };
     let subagent_max_turns = resolve_subagent_max_turns(
         definition.max_turns,
         ctx.parent_max_turns,
@@ -452,7 +462,7 @@ pub(crate) async fn handle_subagent_request(
         && let Some(ref source_model) = source.model_id
         && effective_model_id.0.as_ref() != source_model.as_str()
     {
-        if let Some(resolved) = resolve_model_override_to_config(source_model, &ctx) {
+        if let Ok(resolved) = resolve_model_override_to_config(source_model, &ctx) {
             tracing::info!(
                 subagent_id = % request.id, resolved_model = % effective_model_id.0,
                 source_model = source_model, "Pinning resumed child to source model"
@@ -689,10 +699,23 @@ pub(crate) async fn handle_subagent_request(
             return;
         }
     };
+    let (subagent_first_write_current, subagent_first_write_catalog) =
+        crate::agent::models::subagent_persisted_identity(
+            &ctx.available_models,
+            &effective_model_id,
+            &effective_sampling_config.model,
+        );
     let persistence = match session::persistence::new_with_explicit_dir(
             &child_session_info,
             child_session_dir.clone(),
-            effective_model_id.clone(),
+            // Both halves from what the child ACTUALLY uses (v0.18.7-A):
+            // current = the wire name from the sampling config, catalog = the
+            // canonical key only when the pair is consistent. Passing
+            // `effective_model_id` as current was the same field-semantics slip
+            // step 6b fixed for new sessions — on the inherit path that value
+            // is the parent's catalog KEY, not an upstream model name.
+            subagent_first_write_current.clone(),
+            subagent_first_write_catalog.clone(),
             sampling_client,
             effective_sampling_config.model.clone(),
         )
@@ -1037,7 +1060,15 @@ pub(crate) async fn handle_subagent_request(
     let _ = persistence
         .tx
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
-            model_id: effective_model_id.clone(),
+            // 与首写严格同一对绑定（v0.18.7-A P0 复盘）：此前这里发
+            // effective_model_id + Clear，把 new_with_explicit_dir 刚写对的
+            // (slug, key) 覆盖回 (key, None)——首写修得再对，一条后续消息
+            // 就全部作废。身份只算一次，之后原样复用，不给第二次机会算错。
+            model_id: subagent_first_write_current.clone(),
+            catalog_model_id: match subagent_first_write_catalog.clone() {
+                Some(key) => crate::agent::models::CatalogModelPatch::Set(key),
+                None => crate::agent::models::CatalogModelPatch::Clear,
+            },
             agent_name: Some(definition.name.clone()),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
         });

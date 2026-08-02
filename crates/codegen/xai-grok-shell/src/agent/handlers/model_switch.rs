@@ -1,7 +1,16 @@
-//! Applies a model switch to a session — the ungated path. `set_session_model`
-//! enforces the `allowed_models` gate before delegating here; internal callers
-//! (`new_session`, `load_session`) call `apply` directly.
+//! Applies a model switch to a session.
+//!
+//! This layer takes an already-resolved [`ResolvedModelSelection`] and never
+//! sees a raw id string. That is the point: the catalog key and the entry are
+//! resolved **once**, together, by whichever caller owns the trust decision —
+//! `set_session_model` resolves strictly and gates on `allowed_models`;
+//! `new_session` / `load_session` / unavailable-model recovery resolve as
+//! trusted internal callers, which is how hidden models keep working. Because
+//! the pair arrives atomically, there is no way to end up applying entry A's
+//! endpoint under entry B's key, and nothing downstream re-derives either half
+//! from a string.
 use crate::agent::config;
+use crate::agent::models::ResolvedModelSelection;
 use crate::agent::mvp_agent::{
     MvpAgent, agent_name_after_model_switch, harnesses_are_compatible, resolve_required_agent_type,
 };
@@ -9,29 +18,41 @@ use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::parse_reasoning_effort_meta;
-/// Apply a model switch to a session (no gate — `set_session_model` gates first).
-pub(crate) async fn apply(
+/// Apply an already-resolved model selection to a session.
+///
+/// The selection's catalog key is the single identity used from here on —
+/// session handle, `ModelChanged` broadcast, telemetry, and the persisted
+/// `catalog_model_id` all carry it, so a restore reads back exactly the entry
+/// that ran. Its entry is the only source of the sampling config, so the
+/// endpoint can never come from a different entry than the key.
+pub(crate) async fn apply_resolved(
     agent: &MvpAgent,
-    args: acp::SetSessionModelRequest,
+    session_id: acp::SessionId,
+    selection: ResolvedModelSelection,
+    meta: Option<acp::Meta>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    tracing::info!("Received set session model request {args:?}");
+    let (model_id, model) = selection.into_parts();
+    tracing::info!(
+        session_id = %session_id.0, catalog_key = %model_id.0,
+        upstream_slug = %model.info.model,
+        "apply_resolved: applying model selection"
+    );
     xai_grok_telemetry::unified_log::info(
         "model changed",
-        Some(args.session_id.0.as_ref()),
-        Some(serde_json::json!({ "model" : args.model_id.0.as_ref() })),
+        Some(session_id.0.as_ref()),
+        Some(serde_json::json!({ "model" : model_id.0.as_ref() })),
     );
-    tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
-    let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
-    let acp::SetSessionModelRequest {
-        session_id,
-        model_id,
-        ..
-    } = args;
+    let effort_override = parse_reasoning_effort_meta(meta.as_ref());
     let handle = agent
         .session_handle_waiting_for_load(&session_id)
         .await
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
-    let model = agent.resolve_model_id(&model_id)?;
+    // The identity is known exactly — it arrived resolved — so persistence
+    // always records it. The old `Clear`-on-ambiguity escape hatch is gone
+    // because ambiguity can no longer reach this layer: it is rejected at the
+    // strict entry point, with candidates, before anything is applied.
+    let catalog_model_id =
+        crate::agent::models::CatalogModelPatch::Set(model_id.clone());
     let use_concise = model.info().use_concise;
     let session_default = handle
         .session_default_agent_profile
@@ -181,16 +202,18 @@ pub(crate) async fn apply(
     let model_unchanged = previous_model_id == model_id.0;
     let new_threshold = {
         let cfg = agent.cfg.borrow();
-        let models = agent.models_manager.models();
-        let model = config::find_model_by_id(&models, model_sampling.model.as_str());
+        // Use the entry we were handed, not a fresh `find_model_by_id` on the
+        // slug: that lookup is first-match, so with two entries sharing a slug
+        // it could return the *other* entry's context window.
         crate::util::config::resolve_auto_compact_threshold_percent(
             &cfg,
             model_sampling.model.as_str(),
-            model.map(|e| &e.info),
+            Some(&model.info),
         )
     };
     let (tx, rx) = oneshot::channel();
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
+        catalog_model_id: catalog_model_id.clone(),
         sampling_config: model_sampling,
         use_concise,
         apply_prompt_override,

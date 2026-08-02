@@ -26,6 +26,11 @@ pub struct ForkSessionRequest {
     /// If None, the source session's model will be used.
     #[serde(default)]
     pub new_model_id: Option<String>,
+    /// Catalog key for `new_model_id`, resolved by the ACP entry point where
+    /// the model catalog is available. Not part of the client-facing contract
+    /// — clients send `new_model_id` only.
+    #[serde(skip)]
+    pub new_catalog_model_id: Option<acp::ModelId>,
     #[serde(default)]
     pub target_prompt_index: Option<usize>,
     /// Override `session_kind` in the forked summary. Defaults to `"fork"`.
@@ -96,6 +101,7 @@ pub async fn fork_session(
     let options = CopySessionOptions {
         parent_session_id: Some(request.source_session_id.clone()),
         new_model_id: request.new_model_id.clone(),
+        new_catalog_model_id: request.new_catalog_model_id.clone(),
         target_prompt_index: request.target_prompt_index,
         session_kind: request.session_kind.clone(),
         source_workspace_dir: request.source_workspace_dir.clone(),

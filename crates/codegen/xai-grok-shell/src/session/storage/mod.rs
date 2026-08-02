@@ -301,6 +301,12 @@ pub struct CopySessionOptions {
     pub parent_session_id: Option<String>,
     /// Model ID override for the forked session (None = keep source model).
     pub new_model_id: Option<String>,
+    /// Catalog key that goes with `new_model_id`, already resolved by the
+    /// caller. Ignored unless `new_model_id` is set (with no override the fork
+    /// inherits the source's key instead). `None` means "could not be
+    /// resolved to exactly one entry" — the copy then writes no key rather
+    /// than guessing one.
+    pub new_catalog_model_id: Option<acp::ModelId>,
     /// Truncate copied history to this prompt index (0-based, inclusive).
     pub target_prompt_index: Option<usize>,
     /// When true, skip `transform_conversation_cwd` during copy.
@@ -362,6 +368,7 @@ impl Default for CopySessionOptions {
         Self {
             parent_session_id: None,
             new_model_id: None,
+            new_catalog_model_id: None,
             target_prompt_index: None,
             skip_cwd_transform: false,
             prompt_display_cwd: None,
@@ -490,7 +497,28 @@ pub fn updates_truncate_for_prompt(updates: &[SessionUpdate], target_prompt_inde
 pub trait StorageAdapter: Send + Sync {
     /// Initialize a new session or load existing one
     /// Returns the Summary (creates if needed, loads if exists)
-    async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary>;
+    /// Create the session record, or load it if it already exists.
+    ///
+    /// Compatibility entry: no catalog key (pre-v0.18.6 behavior). Kept as a
+    /// default method so the dual-identity capability does not widen the
+    /// trait's breaking surface — dozens of existing callers and tests stay
+    /// untouched; only the production new-session path opts into
+    /// [`Self::init_session_with_catalog`].
+    async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {
+        self.init_session_with_catalog(info, model_id, None).await
+    }
+
+    /// Create the session record with BOTH halves of the model identity in
+    /// the same first write — `current_model_id` (upstream slug) and
+    /// `catalog_model_id` (exact catalog key) — so no crash window can
+    /// produce a slug-only record. Ignored for sessions that already exist on
+    /// disk: a stored identity is historical fact, init only reads it.
+    async fn init_session_with_catalog(
+        &self,
+        info: &Info,
+        model_id: acp::ModelId,
+        catalog_model_id: Option<acp::ModelId>,
+    ) -> io::Result<Summary>;
 
     /// Set the session title unconditionally (manual `/rename`); last write
     /// wins. Also marks the title manual (`Summary::title_is_manual`) so
@@ -518,7 +546,13 @@ pub trait StorageAdapter: Send + Sync {
     /// Update the current model in summary (delegates to
     /// `update_current_model_and_agent` with `agent_name = None`).
     async fn update_current_model(&self, info: &Info, model_id: &acp::ModelId) -> io::Result<()> {
-        self.update_current_model_and_agent(info, model_id, None, None)
+        self.update_current_model_and_agent(
+            info,
+            model_id,
+            None,
+            None,
+            &crate::agent::models::CatalogModelPatch::Clear,
+        )
             .await
     }
 
@@ -527,12 +561,16 @@ pub trait StorageAdapter: Send + Sync {
     /// persisted so session resume doesn't depend on the mutable model catalog.
     /// `None` leaves the existing `agent_name` unchanged (used by legacy callers
     /// that only update the model ID).
+    ///
+    /// `catalog_model_id` is the stable catalog key; `None` leaves any already
+    /// persisted key untouched (legacy/internal callers that don't know it).
     async fn update_current_model_and_agent(
         &self,
         info: &Info,
         model_id: &acp::ModelId,
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+        catalog_model_id: &crate::agent::models::CatalogModelPatch,
     ) -> io::Result<()>;
 
     /// Update the collection ID for telemetry tracing

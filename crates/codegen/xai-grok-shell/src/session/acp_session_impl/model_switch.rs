@@ -4,12 +4,15 @@ use xai_chat_state::conversation_util::replace_or_insert_system_head;
 impl SessionActor {
     pub(super) async fn handle_set_session_model(
         &self,
+        catalog_model_id: crate::agent::models::CatalogModelPatch,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
     ) -> Result<acp::ModelId, acp::Error> {
+        // Upstream slug — what the request carries. Kept for diagnostics and
+        // for readers of pre-v0.18.6 sessions; it is NOT the identity.
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
@@ -110,6 +113,7 @@ impl SessionActor {
             .persistence_tx
             .send(PersistenceMsg::CurrentModel {
                 model_id: model_id.clone(),
+                catalog_model_id: catalog_model_id.clone(),
                 agent_name: Some(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
             });
