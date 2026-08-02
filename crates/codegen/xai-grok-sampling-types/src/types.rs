@@ -459,6 +459,8 @@ impl ToolCallRequest {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionResponse {
     pub id: String,
+    // 兼容非严格 OpenAI 实现（如智谱 GLM-4V 系列缺 object 字段）
+    #[serde(default)]
     pub object: String,
     pub created: u64,
     pub model: String,
@@ -572,6 +574,8 @@ pub struct CompletionTokensDetails {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionChunk {
     pub id: String,
+    // 兼容非严格 OpenAI 实现（智谱 4V 流式 chunk 同样缺 object）
+    #[serde(default)]
     pub object: String,
     pub created: u64,
     pub model: String,
