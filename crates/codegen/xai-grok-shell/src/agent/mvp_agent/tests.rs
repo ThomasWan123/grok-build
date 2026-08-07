@@ -1135,6 +1135,7 @@ fn make_test_handle(
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        local_extensions_disabled: false,
         info: crate::session::info::Info {
             id: acp::SessionId::new("test"),
             cwd: "/tmp".to_string(),
@@ -2856,6 +2857,7 @@ fn chat_session_spawn_options_matches_thin_profile() {
         None,
         None,
         acp::ModelId::new(std::sync::Arc::from("test-model")),
+        false,
         false,
     );
     assert!(opts.mcp_servers.is_empty());

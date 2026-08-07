@@ -725,6 +725,16 @@ impl SessionActor {
         handle: &xai_grok_agent::plugins::SharedPluginRegistryHandle,
         force: bool,
     ) -> String {
+        // A reload here would rebuild the *shared* registry and fan the result
+        // out to every session, so it is refused rather than made a no-op:
+        // the caller must not believe a global reload happened.
+        if self.rebuild_spec.local_extensions_disabled {
+            tracing::info!(
+                session_id = %self.session_info.id.0,
+                "local_extensions_disabled: refusing plugin reload"
+            );
+            return "Plugins are disabled for this session.".to_string();
+        }
         let session_cwd = std::path::Path::new(&self.session_info.cwd);
 
         let sid = self.session_info.id.0.as_ref();
@@ -834,6 +844,18 @@ impl SessionActor {
         new_registry_snapshot: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
     ) -> (usize, bool, usize) {
         let sid = self.session_info.id.0.as_ref();
+        // Second line behind the broadcast filter, which already skips such
+        // sessions. Kept because this is the only place where an externally
+        // supplied registry is written into `self.plugin_registry`: any future
+        // caller that reaches here — a direct `SessionCommand`, a fork, a
+        // replay — must not be able to install one.
+        if self.rebuild_spec.local_extensions_disabled {
+            tracing::debug!(
+                session_id = sid,
+                "local_extensions_disabled: ignoring plugin registry snapshot"
+            );
+            return (0, false, 0);
+        }
         let session_cwd = std::path::Path::new(&self.session_info.cwd);
 
         // Update session's plugin registry snapshot

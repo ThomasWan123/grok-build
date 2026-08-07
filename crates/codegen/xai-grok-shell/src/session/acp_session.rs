@@ -1173,6 +1173,11 @@ impl SessionActor {
             scheduler: tool_names.iter().any(|n| {
                 n == xai_grok_tools::implementations::grok_build::SCHEDULER_CREATE_TOOL_NAME
             }),
+            // No explicit policy check needed: for a session with
+            // `local_extensions_disabled` both registries are `None` by
+            // construction, so the `/hooks` and `/plugins` families are
+            // already unavailable here. The execution-side refusal in
+            // `slash_exec` is what covers a command being typed anyway.
             hooks: self.hook_registry.borrow().is_some(),
             plugins: self.plugin_registry.borrow().is_some(),
             goal,

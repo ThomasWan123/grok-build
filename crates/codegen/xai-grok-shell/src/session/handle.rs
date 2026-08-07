@@ -148,6 +148,20 @@ pub struct SessionHandle {
     pub allowed_subagent_types: Option<Vec<String>>,
     /// Hook registry for this session (snapshot from spawn time).
     pub hook_registry: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
+    /// Session-scoped policy: when `true`, this session uses built-in tools
+    /// only — every external extension channel (plugins, all hook sources,
+    /// all non-built-in MCP, all LSP, plugin skills/commands) is zeroed.
+    ///
+    /// Set once at spawn from `_meta["x.ai/localExtensionsDisabled"]`; there
+    /// is no setter and no `SessionCommand` variant to flip it. Mirrored on
+    /// [`crate::session::agent_rebuild::AgentRebuildSpec`] so session rebuilds
+    /// (model switch, agent switch) carry the same policy; both are written at
+    /// the same construction point in `spawn_session_actor` and must agree.
+    ///
+    /// Kept as a plain `bool` on the handle so the plugin-registry broadcast
+    /// walk and the `x.ai/*` extension entry points can read it synchronously
+    /// without touching the session actor.
+    pub local_extensions_disabled: bool,
     /// Typed workspace operations handle (agent sessions use local ops).
     pub workspace_ops: xai_grok_workspace::WorkspaceOps,
     /// Terminal backend for this session. Subagents inherit the parent's

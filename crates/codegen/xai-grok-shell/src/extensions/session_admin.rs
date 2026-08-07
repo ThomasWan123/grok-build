@@ -624,11 +624,22 @@ fn handle_auth_cleared(agent: &MvpAgent) -> ExtResult {
 
 async fn handle_plugins_reload(agent: &MvpAgent) -> ExtResult {
     // Rebuild the shared registry so future/new sessions clone the latest.
+    //
+    // This endpoint carries no session id: it is a process-wide rebuild, and
+    // sessions that legitimately use plugins depend on it, so it is not
+    // refused outright. Sessions running with built-in tools only are already
+    // insulated from the result — they are skipped by the fan-out below and
+    // their `apply_plugin_registry_snapshot` early-returns.
+    //
+    // What does need care is the cwd this rebuild is anchored to: taking the
+    // first session in the map could anchor global, project-scoped plugin
+    // discovery to a session that is not allowed to use plugins at all. Such
+    // sessions are skipped when picking it.
     let session_cwd = agent
         .sessions
         .borrow()
         .values()
-        .next()
+        .find(|h| !h.local_extensions_disabled)
         .map(|h| std::path::PathBuf::from(&h.info.cwd));
     let mut plugins = agent.cfg.borrow().plugins.clone();
     plugins.merge_claude_enabled_plugins(session_cwd.as_deref());

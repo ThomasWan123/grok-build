@@ -281,6 +281,14 @@ pub(crate) struct SubagentSpawnContext {
     pub path_not_found_hints: bool,
     /// Plugin registry for plugin-aware agent lookup.
     pub plugin_registry: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
+    /// Inherited from the parent session: built-in tools only.
+    ///
+    /// A subagent is not a fresh session — it is an extension of the session
+    /// that spawned it, so it must not become a way to obtain capabilities
+    /// the parent was denied. Note that inheritance alone is not sufficient:
+    /// the agent definition can carry its own hooks and MCP servers, which are
+    /// materialized in `handle_request` without reading any parent state.
+    pub local_extensions_disabled: bool,
     /// Shared models manager for etag-triggered refresh.
     pub models_manager: crate::agent::models::ModelsManager,
     /// Pre-resolved file tool overrides (hashline vs standard) from the parent.
@@ -1621,6 +1629,10 @@ fn resolve_agent_definition(
 pub(crate) struct SubagentValidationContext {
     pub parent_cwd: PathBuf,
     pub plugin_registry: Option<Arc<xai_grok_agent::plugins::PluginRegistry>>,
+    /// Inherited from the parent session; `true` when the parent could not be
+    /// found, so a validation racing the parent's teardown cannot fall back to
+    /// the permissive answer. See `build_subagent_validation_context`.
+    pub local_extensions_disabled: bool,
     pub subagent_toggle: HashMap<String, bool>,
     pub allowed_subagent_types: Option<Vec<String>>,
     pub cli_agent_names: Vec<String>,

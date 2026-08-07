@@ -228,6 +228,20 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/hooks/list" => {
             let req: ListRequest = super::parse_params(args)?;
             let sid = acp::SessionId::new(req.session_id);
+            // Built from the real DTO and sent through the same
+            // `to_ext_response` as the normal path, so the wire shape stays
+            // identical — including `loadErrors` being omitted when empty. A
+            // hand-written JSON literal here would silently diverge the moment
+            // the DTO gains a field.
+            if agent.session_local_extensions_disabled(&sid) {
+                return super::to_ext_response(Ok::<_, anyhow::Error>(
+                    xai_hooks_plugins_types::HooksListResponse {
+                        hooks: Vec::new(),
+                        project_trusted: false,
+                        load_errors: Vec::new(),
+                    },
+                ));
+            }
 
             let result = agent
                 .list_hooks(&sid)
@@ -238,6 +252,13 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/hooks/action" => {
             let req: xai_hooks_plugins_types::HooksActionRequest = super::parse_params(args)?;
             let sid = acp::SessionId::new(req.session_id);
+            // Refused rather than no-op'd: hook actions change trust and
+            // enablement state on disk, which other sessions read.
+            if agent.session_local_extensions_disabled(&sid) {
+                return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
+                    "hooks_action_refused",
+                ));
+            }
 
             let result = agent
                 .execute_hooks_action(&sid, req.action)

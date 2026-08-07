@@ -311,6 +311,14 @@ impl MvpAgent {
     /// walk once; per-session `build_for_cwd` still re-resolves project-scoped
     /// plugins for each session's own cwd.
     pub(super) fn ensure_plugin_registry(&self) {
+        // Call-count baseline for T16b. Observing "the shared registry is
+        // still empty" is not enough on a connection that also carries
+        // ordinary sessions: those may have populated it long before, so the
+        // final state cannot say who initialized it. Tests take the delta
+        // across a single session creation instead.
+        #[cfg(test)]
+        self.ensure_plugin_registry_calls
+            .set(self.ensure_plugin_registry_calls.get() + 1);
         if self.plugin_registry_initialized.replace(true) {
             return;
         }
@@ -324,6 +332,18 @@ impl MvpAgent {
         tracing::debug!(
             plugin_count = count, "lazily populated plugin registry snapshot"
         );
+    }
+    /// Read the latched built-in-tools-only policy for a live session.
+    ///
+    /// The single read path for the applied-confirmation handshake and for
+    /// the `x.ai/*` extension gates. Deliberately reads the installed
+    /// [`SessionHandle`] rather than the value from the request, so a session
+    /// that failed to assemble reports `false`.
+    pub(crate) fn session_local_extensions_disabled(&self, session_id: &acp::SessionId) -> bool {
+        self.sessions
+            .borrow()
+            .get(session_id)
+            .is_some_and(|h| h.local_extensions_disabled)
     }
     /// Fetch managed configs, merge with client servers, return merged list + earliest expiry.
     pub(super) async fn resolve_mcp_servers(
@@ -1491,6 +1511,8 @@ impl MvpAgent {
                 cfg.plugins.cli_plugin_dirs.clone(),
             ),
             plugin_registry_initialized: std::cell::Cell::new(false),
+            #[cfg(test)]
+            ensure_plugin_registry_calls: std::cell::Cell::new(0),
             persona_io_summaries: cfg
                 .subagent_personas
                 .iter()
@@ -2887,6 +2909,7 @@ impl MvpAgent {
             persisted_goal_mode,
             persisted_announcement_state,
             session_meta,
+            local_extensions_disabled,
             managed_mcp_expires_at,
             model_agent_type,
             session_model_id,
@@ -3263,7 +3286,20 @@ impl MvpAgent {
             }
         }
         let lsp_tools_enabled = self.cfg.borrow().resolve_lsp_tools().value;
-        if lsp_tools_enabled && tool_ctx.lsp.is_none() {
+        // All three LSP sources — plugin manifests, `~/.grok/lsp.json` and the
+        // project's `.grok/lsp.json` — are loaded by the single call inside
+        // this block, so skipping the block is what zeroes all of them. It
+        // also has to happen *here* rather than after: `LspManager::new`
+        // spawns language-server child processes that read the workspace, and
+        // killing them afterwards would not be isolation.
+        if local_extensions_disabled && lsp_tools_enabled {
+            tracing::info!(
+                session_id = %session_info.id.0,
+                "local_extensions_disabled: LSP disabled for this session \
+                 (plugin, user and project sources)"
+            );
+        }
+        if !local_extensions_disabled && lsp_tools_enabled && tool_ctx.lsp.is_none() {
             let snapshot = self.plugin_registry_handle.snapshot();
             let active: Vec<_> = snapshot
                 .iter()
@@ -3352,7 +3388,24 @@ impl MvpAgent {
                 session_meta,
             )
             .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value);
-        let client_hooks = crate::extensions::hooks::parse_client_hooks(session_meta);
+        // Hook source D4: hooks the client ships inside `_meta`. Dropped
+        // rather than merged — otherwise it would be a way around disk
+        // discovery being disabled, which is the whole point of the policy.
+        let client_hooks = {
+            let parsed = crate::extensions::hooks::parse_client_hooks(session_meta);
+            if local_extensions_disabled {
+                if !parsed.is_empty() {
+                    tracing::info!(
+                        session_id = %session_info.id.0,
+                        "local_extensions_disabled: discarding client-provided hooks \
+                         from session _meta"
+                    );
+                }
+                crate::extensions::hooks::ClientHooks::new()
+            } else {
+                parsed
+            }
+        };
         let disable_web_search = self.cfg.borrow().disable_web_search;
         let todo_gate = self.cfg.borrow().todo_gate;
         let remote_settings_for_spawn = self.cfg.borrow().remote_settings.clone();
@@ -3441,9 +3494,25 @@ impl MvpAgent {
                     Some(session_info.id.0.to_string()),
                 ),
             );
+            // Covers hook sources D1 (disk discovery) and D3 (hooks carried by
+            // the agent definition) in one place, because `discover_hooks` is
+            // called from inside this closure. The agent definition itself is
+            // left untouched — it is shared with other sessions, and this
+            // session simply declines to install its hooks.
             let agent_hook_registry_override = agent_definition
                 .hooks
                 .as_ref()
+                .filter(|_| {
+                    if local_extensions_disabled {
+                        tracing::info!(
+                            session_id = %session_info.id.0,
+                            agent = %agent_definition.name,
+                            "local_extensions_disabled: ignoring agent-defined hooks \
+                             and skipping disk hook discovery"
+                        );
+                    }
+                    !local_extensions_disabled
+                })
                 .and_then(|hooks_config| {
                     let hooks_val = hooks_config.as_value();
                     let (specs, errors) = xai_grok_hooks::config::parse_hooks_from_value_with_dir(
@@ -3520,9 +3589,24 @@ impl MvpAgent {
                         reasoning_effort: initial_reasoning_effort,
                     });
             }
-            let acp_mcp_servers = crate::session::acp_mcp::parse_acp_mcp_servers(
-                session_meta,
-            );
+            // MCP source E4: `_meta["x.ai/mcp/servers"]`. A separate path from
+            // `NewSessionRequest.mcp_servers` (E3), so zeroing that one at the
+            // entry does not cover this.
+            let acp_mcp_servers = {
+                let parsed = crate::session::acp_mcp::parse_acp_mcp_servers(session_meta);
+                if local_extensions_disabled {
+                    if !parsed.is_empty() {
+                        tracing::info!(
+                            session_id = %session_info.id.0, count = parsed.len(),
+                            "local_extensions_disabled: ignoring ACP MCP servers \
+                             from session _meta"
+                        );
+                    }
+                    Vec::new()
+                } else {
+                    parsed
+                }
+            };
             let git_head_changed = init
                 .client_capabilities
                 .meta
@@ -3619,7 +3703,20 @@ impl MvpAgent {
                     respect_gitignore,
                     path_not_found_hints,
                     tool_params_json,
-                    {
+                    // The primary interception. `SessionActor.plugin_registry`
+                    // is the field every capability actually reads — skills,
+                    // the slash-command gate, plugin MCP and plugin LSP all
+                    // derive from it — so leaving it `None` zeroes them at the
+                    // source instead of filtering each one downstream. The
+                    // *shared* registry is deliberately left alone: other
+                    // sessions on this connection may legitimately use it.
+                    //
+                    // `refresh_and_build_for_cwd` is not merely discarded but
+                    // never called, so this session performs no plugin
+                    // discovery walk at all.
+                    if local_extensions_disabled {
+                        None
+                    } else {
                         let session_cwd = std::path::Path::new(&session_info.cwd);
                         let disk_cfg = crate::config::resolve_effective_plugins_config(
                                 session_cwd,
@@ -3633,7 +3730,15 @@ impl MvpAgent {
                                 folder_trust::project_scope_allowed(session_cwd),
                             )
                     },
-                    Some(self.plugin_registry_handle.clone()),
+                    // Withholding the shared handle removes the session's
+                    // ability to trigger a global rebuild via `/plugins
+                    // reload`; the explicit rejections elsewhere are the
+                    // user-visible half of the same rule.
+                    if local_extensions_disabled {
+                        None
+                    } else {
+                        Some(self.plugin_registry_handle.clone())
+                    },
                     self.models_manager.clone(),
                     None,
                     None,
@@ -3658,6 +3763,7 @@ impl MvpAgent {
                     None,
                     max_turns,
                     None,
+                    local_extensions_disabled,
                 )
                 .await?
         };

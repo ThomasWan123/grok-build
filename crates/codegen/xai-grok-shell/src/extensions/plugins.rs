@@ -139,6 +139,18 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             // `_meta.pluginDirs` plugins. Only an unknown session (a pull
             // before any session exists) falls back to the shared snapshot.
             let sid = acp::SessionId::new(req.session_id);
+            // Empty list rather than an error: the UI renders an empty state
+            // fine, whereas an error would force every caller to tell "no
+            // plugins" apart from "the call failed" — and callers that get
+            // that wrong tend to get it wrong in the permissive direction.
+            //
+            // Note this also has to bypass the unknown-session fallback
+            // below, which would otherwise answer from the *shared* snapshot.
+            if agent.session_local_extensions_disabled(&sid) {
+                return super::to_ext_response(Ok::<_, anyhow::Error>(PluginsListResponse {
+                    plugins: Vec::new(),
+                }));
+            }
             let registry = match agent.session_handle_waiting_for_load(&sid).await {
                 Some(handle) => handle.plugins_list().await,
                 None => agent.plugin_registry_snapshot(),
@@ -161,6 +173,14 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/plugins/action" => {
             let req: xai_hooks_plugins_types::PluginsActionRequest = super::parse_params(args)?;
             let sid = acp::SessionId::new(req.session_id);
+            // Refused, not silently ignored: `Reload` rebuilds the shared
+            // registry and fans it out process-wide, so a caller that got an
+            // "ok" back would reasonably believe that happened.
+            if agent.session_local_extensions_disabled(&sid) {
+                return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
+                    "plugins_action_refused",
+                ));
+            }
 
             let result = agent
                 .execute_plugins_action(&sid, req.action)

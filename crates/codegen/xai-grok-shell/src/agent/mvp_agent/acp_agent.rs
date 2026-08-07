@@ -815,6 +815,14 @@ impl acp::Agent for MvpAgent {
         tracing::debug!(
             config = ? self.sampling_config, "Received new session request {arguments:?}"
         );
+        // Parsed before anything else that could act on the request. In
+        // particular this must precede `resolve_mcp_servers` below, which
+        // both merges MCP servers and initializes the shared plugin registry
+        // as a side effect — deciding the policy afterwards would mean the
+        // work it is supposed to prevent had already happened.
+        let local_extensions_disabled = super::parse_local_extensions_disabled(
+            arguments.meta.as_ref(),
+        )?;
         let init = self
             .initialize_request
             .get()
@@ -830,10 +838,31 @@ impl acp::Agent for MvpAgent {
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
         folder_trust::resolve_and_record(cwd.as_path(), remote_settings.as_ref(), false);
-        let initial_client_mcp_servers = arguments.mcp_servers.clone();
-        let (mcp_servers, managed_mcp_expires_at) = self
-            .resolve_mcp_servers(arguments.mcp_servers, cwd.as_path())
-            .await;
+        // MCP sources E1 (plugin), E2 (managed) and E3 (client-provided) all
+        // flow through `resolve_mcp_servers`, so skipping the call zeroes the
+        // three of them together — and, just as importantly, avoids the
+        // `ensure_plugin_registry` call it makes internally. E4 (the `_meta`
+        // channel) is a separate path, handled in `spawn_and_register_session`.
+        //
+        // `initial_client_mcp_servers` is emptied too: it is retained on the
+        // handle so a later plugin reload can recompute the merged list, and
+        // keeping the client's servers there would let them reappear.
+        let (initial_client_mcp_servers, mcp_servers, managed_mcp_expires_at) =
+            if local_extensions_disabled {
+                if !arguments.mcp_servers.is_empty() {
+                    tracing::info!(
+                        count = arguments.mcp_servers.len(),
+                        "local_extensions_disabled: discarding client-provided MCP servers"
+                    );
+                }
+                (Vec::new(), Vec::new(), None)
+            } else {
+                let initial = arguments.mcp_servers.clone();
+                let (merged, expires_at) = self
+                    .resolve_mcp_servers(arguments.mcp_servers, cwd.as_path())
+                    .await;
+                (initial, merged, expires_at)
+            };
         let mcp_meta_config_map = parse_mcp_meta_config(arguments.meta.as_ref());
         let client_session_id = arguments
             .meta
@@ -1094,6 +1123,7 @@ impl acp::Agent for MvpAgent {
                     model_agent_type.as_deref(),
                     session_model_id,
                     session_yolo_mode,
+                    local_extensions_disabled,
                 )
             } else {
                 SessionSpawnOptions {
@@ -1117,6 +1147,7 @@ impl acp::Agent for MvpAgent {
                         persisted_goal_mode: None,
                         persisted_announcement_state: None,
                         session_meta: arguments.meta.as_ref(),
+                        local_extensions_disabled,
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
                         session_model_id,
@@ -1246,6 +1277,21 @@ impl acp::Agent for MvpAgent {
         if let Some(obj) = meta.as_object_mut() {
             obj.insert("x.ai/sessionConfig".to_string(), session_config_value);
             obj.insert("x.ai/sessionDetail".to_string(), session_detail_value);
+            // Applied-confirmation handshake. The value is read back off the
+            // handle that was actually installed, never echoed from the
+            // request: a request that asked for the policy but whose actor
+            // failed to assemble it must not receive a confirmation. Clients
+            // that require the policy can then treat "absent or false" as a
+            // hard failure, which also makes older engines fail closed.
+            //
+            // Only emitted when the policy is on, so clients that never asked
+            // for it see byte-identical response metadata.
+            if self.session_local_extensions_disabled(&session_id) {
+                obj.insert(
+                    "localExtensionsDisabledApplied".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
         }
         Ok(
             acp::NewSessionResponse::new(session_id)
@@ -1258,6 +1304,32 @@ impl acp::Agent for MvpAgent {
         arguments: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
         let _load_guard = self.begin_session_load(&arguments.session_id);
+        // Parsed and compared before `sweep_dead_sessions` /
+        // `drain_old_session_thread` and well before `resolve_mcp_servers`,
+        // so a rejected load leaves the resident session exactly as it was.
+        let local_extensions_disabled = super::parse_local_extensions_disabled(
+            arguments.meta.as_ref(),
+        )?;
+        // The policy is fixed for the lifetime of a session actor. A load
+        // whose request disagrees with the resident actor is a client bug or
+        // an attempt to relax an already-running session, and either way the
+        // safe answer is to refuse rather than to pick a winner: silently
+        // honouring the request would downgrade a protected session, and
+        // silently ignoring it would hand the caller a session that is not
+        // what it asked for.
+        if let Some(resident) = self
+            .sessions
+            .borrow()
+            .get(&arguments.session_id)
+            .map(|h| h.local_extensions_disabled)
+            && resident != local_extensions_disabled
+        {
+            tracing::warn!(
+                session_id = %arguments.session_id.0, resident, requested = local_extensions_disabled,
+                "load_session: local_extensions_disabled conflicts with resident session"
+            );
+            return Err(super::local_extensions_disabled_error("immutable_conflict"));
+        }
         self.sweep_dead_sessions();
         self.drain_old_session_thread(&arguments.session_id).await;
         tracing::debug!("Received load session request {arguments:?}");
@@ -1290,10 +1362,23 @@ impl acp::Agent for MvpAgent {
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
         folder_trust::resolve_and_record(cwd.as_path(), remote_settings.as_ref(), false);
-        let initial_client_mcp_servers = client_mcp_servers.clone();
-        let (mcp_servers, managed_mcp_expires_at) = self
-            .resolve_mcp_servers(client_mcp_servers, cwd.as_path())
-            .await;
+        // Same three-source zeroing as `new_session`; see the comment there.
+        let (initial_client_mcp_servers, mcp_servers, managed_mcp_expires_at) =
+            if local_extensions_disabled {
+                if !client_mcp_servers.is_empty() {
+                    tracing::info!(
+                        session_id = %session_id.0, count = client_mcp_servers.len(),
+                        "local_extensions_disabled: discarding client-provided MCP servers"
+                    );
+                }
+                (Vec::new(), Vec::new(), None)
+            } else {
+                let initial = client_mcp_servers.clone();
+                let (merged, expires_at) = self
+                    .resolve_mcp_servers(client_mcp_servers, cwd.as_path())
+                    .await;
+                (initial, merged, expires_at)
+            };
         let mcp_meta_config_map = parse_mcp_meta_config(request_meta.as_ref());
         let mut load_timer = crate::instrumentation_timer!("session.load_session");
         load_timer.with_field("session_id", session_id.0.as_ref());
@@ -1660,6 +1745,7 @@ impl acp::Agent for MvpAgent {
                         persisted_goal_mode: _persisted_goal_mode,
                         persisted_announcement_state,
                         session_meta: request_meta.as_ref(),
+                        local_extensions_disabled,
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
                         session_model_id: summary.current_model_id.clone(),
@@ -1705,7 +1791,11 @@ impl acp::Agent for MvpAgent {
                 );
             }
         }
+        // Hook source D5. Reconnect is the one path that can install hooks on
+        // an *already running* actor, so it needs its own guard: the spawn
+        // path's D4 handling never runs here.
         if session_exists
+            && !local_extensions_disabled
             && let Some(hooks) = crate::extensions::hooks::reconnect_client_hooks(
                 request_meta.as_ref(),
             ) && let Some(handle) = self.sessions.borrow().get(&session_id)
@@ -2116,6 +2206,13 @@ impl acp::Agent for MvpAgent {
             );
         response_meta_map.insert("x.ai/sessionConfig".to_string(), session_config_value);
         response_meta_map.insert("x.ai/sessionDetail".to_string(), session_detail_value);
+        // Same handshake as `new_session`; see the comment there.
+        if self.session_local_extensions_disabled(&session_id) {
+            response_meta_map.insert(
+                "localExtensionsDisabledApplied".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         let response_meta = serde_json::Value::Object(response_meta_map);
         xai_grok_telemetry::unified_log::info(
             "session loaded",

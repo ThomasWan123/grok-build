@@ -275,9 +275,28 @@ impl MvpAgent {
             let cfg = self.cfg.borrow();
             cfg.cli_agents.iter().map(|d| d.name.clone()).collect()
         };
+        // This constructor tolerates an evicted parent (see the doc comment
+        // above), which makes the missing case a real code path rather than a
+        // theoretical one — a `ValidateType` can arrive while the parent is
+        // being torn down. Falling back to `false` there would hand out the
+        // shared plugin registry and re-expose plugin agents to a session
+        // whose policy simply could not be read, so the fallback is `true`.
+        let local_extensions_disabled = self
+            .sessions
+            .borrow()
+            .get(&parent_sid)
+            .map_or(true, |h| h.local_extensions_disabled);
         crate::agent::subagent::SubagentValidationContext {
             parent_cwd,
-            plugin_registry: self.plugin_registry_handle.snapshot(),
+            // Injection source I1: this is the *shared* registry, unrelated to
+            // the parent session's own (zeroed) one, so inheriting the policy
+            // bit without also zeroing this would change nothing.
+            plugin_registry: if local_extensions_disabled {
+                None
+            } else {
+                self.plugin_registry_handle.snapshot()
+            },
+            local_extensions_disabled,
             subagent_toggle: self.subagent_toggle.clone(),
             allowed_subagent_types,
             cli_agent_names,
@@ -401,6 +420,13 @@ impl MvpAgent {
                 .get(&parent_sid)
                 .and_then(|h| h.hook_registry.clone())
         };
+        // Fail closed on a missing parent, for the same reason as in
+        // `build_subagent_validation_context`.
+        let local_extensions_disabled = self
+            .sessions
+            .borrow()
+            .get(&parent_sid)
+            .map_or(true, |h| h.local_extensions_disabled);
         let parent_max_turns = {
             let sessions = self.sessions.borrow();
             sessions.get(&parent_sid).and_then(|h| h.max_turns)
@@ -499,7 +525,14 @@ impl MvpAgent {
             backend_tools_enabled: self.cfg.borrow().resolve_backend_tools().value,
             respect_gitignore: self.cfg.borrow().respect_gitignore,
             path_not_found_hints: self.cfg.borrow().path_not_found_hints,
-            plugin_registry: self.plugin_registry_handle.snapshot(),
+            // Injection source I1, spawn side. See the note in
+            // `build_subagent_validation_context`.
+            plugin_registry: if local_extensions_disabled {
+                None
+            } else {
+                self.plugin_registry_handle.snapshot()
+            },
+            local_extensions_disabled,
             models_manager: self.models_manager.clone(),
             file_tool_overrides: {
                 let cfg = self.cfg.borrow();

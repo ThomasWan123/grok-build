@@ -113,6 +113,57 @@ pub(crate) fn reject_direct_hub_cloud_meta(
     }
     Ok(())
 }
+/// Session `_meta` key carrying the built-in-tools-only policy.
+///
+/// Top-level, alongside `x.ai/mcp/servers` and `agentProfile` — deliberately
+/// *not* nested under `startupHints`, which is parsed from `initialize` and is
+/// therefore per-connection, not per-session.
+pub(crate) const LOCAL_EXTENSIONS_DISABLED_META_KEY: &str = "x.ai/localExtensionsDisabled";
+/// Structured rejection used by every gate that refuses an operation because
+/// the session runs with `local_extensions_disabled`.
+///
+/// Deliberately free of any client-side surface/layer name: the engine knows
+/// only that a policy bit is set, and must not pretend to know how the client
+/// labels its session kinds.
+pub(crate) fn local_extensions_disabled_error(reason: &str) -> acp::Error {
+    acp::Error::invalid_request()
+        .data(serde_json::json!({
+            "code": "local_extensions_disabled",
+            "policy": "local_extensions_disabled",
+            "reason": reason,
+        }))
+}
+/// Parse the built-in-tools-only policy out of session `_meta`.
+///
+/// Absent key ⇒ `false`, so clients that never heard of this policy keep their
+/// exact current behaviour. Anything present but not a JSON boolean is a hard
+/// error rather than a silent `false` (T11): a client that sends `"true"` or
+/// `1` believes it asked for the policy, and quietly running without it is the
+/// one failure mode this interface exists to prevent.
+pub(crate) fn parse_local_extensions_disabled(
+    session_meta: Option<&acp::Meta>,
+) -> Result<bool, acp::Error> {
+    match session_meta.and_then(|m| m.get(LOCAL_EXTENSIONS_DISABLED_META_KEY)) {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(
+            local_extensions_disabled_error("invalid_type")
+                .data(serde_json::json!({
+                    "code": "local_extensions_disabled",
+                    "policy": "local_extensions_disabled",
+                    "reason": "invalid_type",
+                    "expected": "boolean",
+                    "received": match other {
+                        serde_json::Value::String(_) => "string",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::Array(_) => "array",
+                        serde_json::Value::Object(_) => "object",
+                        _ => "unknown",
+                    },
+                })),
+        ),
+    }
+}
 /// Marks a notification's meta field with `isReplay: true` for replayed session updates.
 /// If `persist_data` is provided, it will be included in the meta under `x.ai/persist`.
 /// Extract the numeric `tier` claim from a JWT access token (no signature
@@ -208,6 +259,11 @@ pub(crate) struct SessionSpawnOptions<'a> {
         crate::session::announcement_state::AnnouncementState,
     >,
     pub session_meta: Option<&'a acp::Meta>,
+    /// Parsed at the New/Load entry point — before `resolve_mcp_servers` and
+    /// before any resident-session side effect — and passed down rather than
+    /// re-parsed here, so there is exactly one place where the wire value
+    /// becomes a policy decision.
+    pub local_extensions_disabled: bool,
     pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
@@ -327,10 +383,12 @@ pub(crate) fn chat_session_spawn_options<'a>(
     model_agent_type: Option<&'a str>,
     session_model_id: acp::ModelId,
     session_yolo_mode: bool,
+    local_extensions_disabled: bool,
 ) -> SessionSpawnOptions<'a> {
     SessionSpawnOptions {
         session_info,
         cwd,
+        local_extensions_disabled,
         mcp_servers: Vec::new(),
         initial_client_mcp_servers: Vec::new(),
         mcp_meta_config_map: Default::default(),
@@ -840,6 +898,14 @@ pub struct MvpAgent {
     /// the first session-creating call via [`Self::ensure_plugin_registry`];
     /// this flag keeps that to a single discovery walk.
     plugin_registry_initialized: std::cell::Cell<bool>,
+    /// Test-only call counter for [`Self::ensure_plugin_registry`] (T16b).
+    ///
+    /// Exists because "the shared registry is still empty" is not evidence
+    /// that a given session left it alone — on a connection that also carries
+    /// ordinary sessions it may have been populated earlier by one of those.
+    /// Tests take the delta across one session creation instead.
+    #[cfg(test)]
+    pub(crate) ensure_plugin_registry_calls: std::cell::Cell<u32>,
     persona_io_summaries: Vec<String>,
     /// Single-flight guard for the proactive bundle sync background task.
     ///
@@ -2132,6 +2198,19 @@ impl MvpAgent {
             .iter()
             .filter_map(|(sid, h)| {
                 if skip == Some(sid) {
+                    return None;
+                }
+                // Process-wide fan-out is what lets one session's plugin
+                // reload reach every other session. Sessions running with
+                // built-in tools only are excluded here rather than left to
+                // reject the snapshot on arrival — `apply_plugin_registry_snapshot`
+                // still early-returns as a second line, but not sending is
+                // what makes the guarantee independent of that.
+                if h.local_extensions_disabled {
+                    tracing::debug!(
+                        session_id = %sid.0,
+                        "local_extensions_disabled: skipped in plugin registry broadcast"
+                    );
                     return None;
                 }
                 Some((std::path::PathBuf::from(&h.info.cwd), h.cmd_tx.clone()))

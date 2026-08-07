@@ -218,6 +218,19 @@ impl SessionActor {
         prompt_id: Option<&str>,
         tool_name: Option<&str>,
     ) {
+        // Second line only. A session running with built-in tools only should
+        // already have an empty hook registry and no client hooks, so
+        // `hook_event_active` below would return `false` on its own; this
+        // guard is here so that a future source which populates either of
+        // those without going through the spawn path still cannot fire hooks
+        // in such a session. If it ever triggers, something upstream leaked.
+        if self.rebuild_spec.local_extensions_disabled {
+            debug_assert!(
+                !self.hook_event_active(event),
+                "local_extensions_disabled session has live hooks: {event:?}"
+            );
+            return;
+        }
         if !self.hook_event_active(event) {
             return;
         }

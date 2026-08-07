@@ -879,7 +879,19 @@ pub(crate) async fn handle_subagent_request(
     }
     let is_plugin_agent = definition.plugin_name.is_some();
     if let Some(ref hooks_config) = definition.hooks {
-        if is_plugin_agent {
+        // Injection source I2. The branch below builds a registry from the
+        // agent definition with `unwrap_or_default()`, so a parent whose own
+        // hook registry is `None` does not protect the child — this arm would
+        // create a non-empty registry out of nothing. Inheriting the policy
+        // bit is therefore necessary but not sufficient; the materialization
+        // has to be refused here.
+        if ctx.local_extensions_disabled {
+            tracing::info!(
+                agent = %definition.name,
+                parent_session_id = %ctx.parent_session_id,
+                "local_extensions_disabled: ignoring agent-defined hooks for subagent"
+            );
+        } else if is_plugin_agent {
             tracing::warn!(
                 agent = % definition.name, plugin = ? definition.plugin_name,
                 "ignoring hooks on plugin agent (not supported for security)"
@@ -924,7 +936,20 @@ pub(crate) async fn handle_subagent_request(
             }
         }
     }
-    let agent_mcp_servers: Vec<_> = if is_plugin_agent {
+    // Injection source I3. Distinct from I1/I2: `McpServerRef::Inline` builds
+    // its config straight out of the agent definition and consults no parent
+    // state at all, so an empty parent MCP list does not neutralize it the way
+    // it neutralizes `Named` references.
+    let agent_mcp_servers: Vec<_> = if ctx.local_extensions_disabled {
+        if !definition.mcp_servers.is_empty() {
+            tracing::info!(
+                agent = %definition.name, count = definition.mcp_servers.len(),
+                parent_session_id = %ctx.parent_session_id,
+                "local_extensions_disabled: ignoring agent-defined MCP servers for subagent"
+            );
+        }
+        vec![]
+    } else if is_plugin_agent {
         if !definition.mcp_servers.is_empty() {
             tracing::warn!(
                 agent = % definition.name, plugin = ? definition.plugin_name,
@@ -1215,6 +1240,7 @@ pub(crate) async fn handle_subagent_request(
             ctx.parent_scheduler_handle.clone(),
             subagent_max_turns,
             forked_tool_override,
+            ctx.local_extensions_disabled,
         )
         .await;
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {

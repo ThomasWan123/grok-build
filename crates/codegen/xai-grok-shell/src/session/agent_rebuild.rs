@@ -114,6 +114,14 @@ pub(crate) struct AgentRebuildSpec {
     pub prompt_working_directory: Option<String>,
     pub lsp: Option<Arc<dyn LspBackend>>,
     pub plugin_registry: Option<Arc<xai_grok_agent::plugins::PluginRegistry>>,
+    /// Session-scoped policy mirror of
+    /// [`crate::session::SessionHandle::local_extensions_disabled`].
+    ///
+    /// Lives on the rebuild spec (rather than as a `SessionActor` field) so
+    /// every rebuild path — model switch, agent switch — carries the policy
+    /// forward without a separate memory. Actor-side reads go through
+    /// `self.rebuild_spec.local_extensions_disabled`.
+    pub local_extensions_disabled: bool,
     pub api_key_provider: Option<SharedApiKeyProvider>,
     pub attribution_callback: Option<xai_grok_tools::SharedAttributionCallback>,
     pub tool_params_json: ResolvedToolParamsJson,
@@ -208,6 +216,11 @@ impl AgentRebuildSpec {
             prompt_working_directory,
             lsp,
             plugin_registry,
+            // Read by the session actor via `self.rebuild_spec`; `build_agent`
+            // itself needs no branch, because every extension channel it could
+            // consume is already zeroed upstream (`plugin_registry` is `None`,
+            // `lsp` is `None`, `skills_config` is empty) when this is `true`.
+            local_extensions_disabled: _,
             api_key_provider,
             attribution_callback,
             tool_params_json,
@@ -410,6 +423,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         prompt_working_directory: None,
         lsp: None,
         plugin_registry: None,
+        local_extensions_disabled: false,
         api_key_provider: None,
         attribution_callback: None,
         tool_params_json: ResolvedToolParamsJson::default(),

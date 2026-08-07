@@ -172,6 +172,17 @@ impl SessionActor {
     /// and re-advertise slash commands to the client. Returns the number
     /// of skills discovered.
     pub(super) async fn reload_skills_from_disk(&self) -> usize {
+        // Plugin-contributed skills are already gone with the session's
+        // (absent) plugin registry, but `list_skills_with_plugins` also walks
+        // disk skill directories — so returning early here is what keeps the
+        // policy from depending on which argument happens to be `None`.
+        if self.rebuild_spec.local_extensions_disabled {
+            tracing::debug!(
+                session_id = %self.session_info.id.0,
+                "local_extensions_disabled: skipping skills reload"
+            );
+            return 0;
+        }
         let cwd = &self.session_info.cwd;
         let skills_config = crate::util::config::load_config().await.skills;
         let plugin_snapshot = self.plugin_registry.borrow().clone();

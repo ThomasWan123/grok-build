@@ -194,6 +194,12 @@ pub(crate) async fn spawn_session_actor(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
+    // Session-scoped policy: built-in tools only, every external extension
+    // channel zeroed. Callers are responsible for zeroing the *inputs* they
+    // own (`plugin_registry`, `lsp`, MCP lists, client hooks); this function
+    // additionally forces the hook registry to `None` so that the local
+    // discovery fallback below cannot re-introduce disk hooks.
+    local_extensions_disabled: bool,
 ) -> Result<
     (
         SessionHandle,
@@ -819,6 +825,9 @@ pub(crate) async fn spawn_session_actor(
     };
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
         working_directory: tool_context.cwd.as_path().to_path_buf(),
+        // Written here and on the `SessionHandle` below from the same
+        // parameter — the two mirrors must never diverge (T19).
+        local_extensions_disabled,
         terminal_backend: terminal_backend.clone(),
         fs_backend: fs_backend.clone(),
         tools_notification_handle: tools_notification_handle.clone(),
@@ -1054,7 +1063,19 @@ pub(crate) async fn spawn_session_actor(
     let allowed_subagent_types_for_handle = agent.definition().allowed_subagent_types.clone();
     let mut hook_discovery_errors: Vec<xai_grok_hooks::error::HookError> = Vec::new();
     let built_hook_registry: Option<Arc<xai_grok_hooks::discovery::HookRegistry>> =
-        if let Some(override_reg) = hook_registry_override {
+        if local_extensions_disabled {
+            // Final gate for hook source D1. `agent_ops` already skips disk
+            // discovery on the input side; this arm is the second half of the
+            // same defence and is what makes the *fallback* below unreachable
+            // — without it, a caller that passes no override would still get a
+            // freshly discovered disk registry here.
+            tracing::debug!(
+                session_id = %session_info.id.0,
+                had_override = hook_registry_override.is_some(),
+                "local_extensions_disabled: hook registry forced to None"
+            );
+            None
+        } else if let Some(override_reg) = hook_registry_override {
             Some(override_reg)
         } else {
             let cwd_path = std::path::Path::new(&session_info.cwd);
@@ -1616,6 +1637,8 @@ pub(crate) async fn spawn_session_actor(
             current_prompt_id,
             pending_interactions,
             info: session_info,
+            // Same source as `rebuild_spec.local_extensions_disabled` above.
+            local_extensions_disabled,
             max_turns,
             hunk_tracker_handle,
             chat_state_handle: chat_state_handle_for_handle,
@@ -1790,6 +1813,8 @@ pub(crate) async fn spawn_session_on_thread(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
+    // Forwarded verbatim to `spawn_session_actor`.
+    local_extensions_disabled: bool,
 ) -> Result<
     (
         SessionHandle,
@@ -1947,6 +1972,7 @@ pub(crate) async fn spawn_session_on_thread(
                         parent_scheduler_handle,
                         max_turns,
                         forked_tool_override,
+                        local_extensions_disabled,
                     )
                     .await
                     {

@@ -10,6 +10,42 @@ impl SessionActor {
             command: action.command_name().to_string(),
             args_provided: action.args_provided(),
         });
+        // The command gate already hides every `/hooks` and `/plugins`
+        // subcommand from such a session, because it derives availability from
+        // the (absent) hook and plugin registries. This blocks them at
+        // execution too, since the gate governs what is *advertised* and a
+        // command can still be typed. It covers the whole family rather than
+        // the read-only ones: `/plugins install`, `add`, `remove`, `update`
+        // and `trust` mutate global plugin state that other sessions on this
+        // connection consume, and this session must not be the one to do that.
+        if self.rebuild_spec.local_extensions_disabled
+            && matches!(
+                action,
+                BuiltinAction::HooksTrust
+                    | BuiltinAction::HooksList
+                    | BuiltinAction::HooksAdd { .. }
+                    | BuiltinAction::HooksRemove { .. }
+                    | BuiltinAction::HooksUntrust
+                    | BuiltinAction::PluginsList
+                    | BuiltinAction::PluginsReload
+                    | BuiltinAction::PluginsTrust
+                    | BuiltinAction::PluginsAdd { .. }
+                    | BuiltinAction::PluginsRemove { .. }
+                    | BuiltinAction::PluginsInstall { .. }
+                    | BuiltinAction::PluginsUninstall { .. }
+                    | BuiltinAction::PluginsUpdate { .. }
+            )
+        {
+            tracing::info!(
+                session_id = %self.session_info.id.0, command = action.command_name(),
+                "local_extensions_disabled: refusing extension slash command"
+            );
+            self.send_slash_command_output(
+                "Local extensions are disabled for this session.",
+            )
+            .await;
+            return ok_end_turn(0, None);
+        }
         match action {
             BuiltinAction::Compact { user_context } => {
                 self.run_compact(user_context).await?;
