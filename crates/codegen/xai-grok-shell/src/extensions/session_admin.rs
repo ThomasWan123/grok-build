@@ -635,12 +635,28 @@ async fn handle_plugins_reload(agent: &MvpAgent) -> ExtResult {
     // first session in the map could anchor global, project-scoped plugin
     // discovery to a session that is not allowed to use plugins at all. Such
     // sessions are skipped when picking it.
-    let session_cwd = agent
-        .sessions
-        .borrow()
-        .values()
-        .find(|h| !h.local_extensions_disabled)
-        .map(|h| std::path::PathBuf::from(&h.info.cwd));
+    let (session_cwd, has_eligible_session) = {
+        let sessions = agent.sessions.borrow();
+        let eligible = sessions
+            .values()
+            .find(|h| !h.local_extensions_disabled)
+            .map(|h| std::path::PathBuf::from(&h.info.cwd));
+        (eligible, sessions.values().any(|h| !h.local_extensions_disabled))
+    };
+    // If *every* live session is restricted to built-in tools, there is nobody
+    // on this connection the rebuild could serve, and running it anyway would
+    // both anchor discovery to no cwd at all and do plugin work on behalf of
+    // sessions that are not allowed any. Refuse instead — silently rebuilding
+    // would tell the caller a reload succeeded when nothing can consume it.
+    if !has_eligible_session {
+        tracing::info!(
+            "local_extensions_disabled: refusing global plugin reload \
+             (no session on this connection may use local extensions)"
+        );
+        return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
+            "no_eligible_session",
+        ));
+    }
     let mut plugins = agent.cfg.borrow().plugins.clone();
     plugins.merge_claude_enabled_plugins(session_cwd.as_deref());
     let disk_cfg = plugins.to_discovery_config();

@@ -135,16 +135,19 @@ pub(crate) fn local_extensions_disabled_error(reason: &str) -> acp::Error {
 }
 /// Parse the built-in-tools-only policy out of session `_meta`.
 ///
-/// Absent key ⇒ `false`, so clients that never heard of this policy keep their
-/// exact current behaviour. Anything present but not a JSON boolean is a hard
-/// error rather than a silent `false` (T11): a client that sends `"true"` or
-/// `1` believes it asked for the policy, and quietly running without it is the
-/// one failure mode this interface exists to prevent.
+/// Only an *absent* key means `false`, so clients that never heard of this
+/// policy keep their exact current behaviour. Anything present but not a JSON
+/// boolean — including an explicit `null` — is a hard error rather than a
+/// silent `false` (T11): a client that sends `"true"`, `1` or `null` believes
+/// it asked for the policy, and quietly running without it is the one failure
+/// mode this interface exists to prevent. `null` in particular is what a
+/// client emits when its own value was absent or failed to serialize, which is
+/// exactly the case that must not be read as a deliberate "no".
 pub(crate) fn parse_local_extensions_disabled(
     session_meta: Option<&acp::Meta>,
 ) -> Result<bool, acp::Error> {
     match session_meta.and_then(|m| m.get(LOCAL_EXTENSIONS_DISABLED_META_KEY)) {
-        None | Some(serde_json::Value::Null) => Ok(false),
+        None => Ok(false),
         Some(serde_json::Value::Bool(b)) => Ok(*b),
         Some(other) => Err(
             local_extensions_disabled_error("invalid_type")
@@ -154,6 +157,7 @@ pub(crate) fn parse_local_extensions_disabled(
                     "reason": "invalid_type",
                     "expected": "boolean",
                     "received": match other {
+                        serde_json::Value::Null => "null",
                         serde_json::Value::String(_) => "string",
                         serde_json::Value::Number(_) => "number",
                         serde_json::Value::Array(_) => "array",
@@ -898,13 +902,17 @@ pub struct MvpAgent {
     /// the first session-creating call via [`Self::ensure_plugin_registry`];
     /// this flag keeps that to a single discovery walk.
     plugin_registry_initialized: std::cell::Cell<bool>,
-    /// Test-only call counter for [`Self::ensure_plugin_registry`] (T16b).
+    /// Call counter for [`Self::ensure_plugin_registry`] (T16b).
     ///
     /// Exists because "the shared registry is still empty" is not evidence
     /// that a given session left it alone — on a connection that also carries
     /// ordinary sessions it may have been populated earlier by one of those.
     /// Tests take the delta across one session creation instead.
-    #[cfg(test)]
+    ///
+    /// Behind `local-extensions-test-support` rather than `cfg(test)` because
+    /// the tests are an integration target, which links the library built
+    /// without `cfg(test)`.
+    #[cfg(feature = "local-extensions-test-support")]
     pub(crate) ensure_plugin_registry_calls: std::cell::Cell<u32>,
     persona_io_summaries: Vec<String>,
     /// Single-flight guard for the proactive bundle sync background task.

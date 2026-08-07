@@ -1286,7 +1286,7 @@ impl acp::Agent for MvpAgent {
             //
             // Only emitted when the policy is on, so clients that never asked
             // for it see byte-identical response metadata.
-            if self.session_local_extensions_disabled(&session_id) {
+            if self.session_local_extensions_disabled(&session_id) == Some(true) {
                 obj.insert(
                     "localExtensionsDisabledApplied".to_string(),
                     serde_json::Value::Bool(true),
@@ -2207,7 +2207,7 @@ impl acp::Agent for MvpAgent {
         response_meta_map.insert("x.ai/sessionConfig".to_string(), session_config_value);
         response_meta_map.insert("x.ai/sessionDetail".to_string(), session_detail_value);
         // Same handshake as `new_session`; see the comment there.
-        if self.session_local_extensions_disabled(&session_id) {
+        if self.session_local_extensions_disabled(&session_id) == Some(true) {
             response_meta_map.insert(
                 "localExtensionsDisabledApplied".to_string(),
                 serde_json::Value::Bool(true),

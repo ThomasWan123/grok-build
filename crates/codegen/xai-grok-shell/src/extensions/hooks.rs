@@ -233,7 +233,10 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             // identical — including `loadErrors` being omitted when empty. A
             // hand-written JSON literal here would silently diverge the moment
             // the DTO gains a field.
-            if agent.session_local_extensions_disabled(&sid) {
+            // Unknown ids answer empty as well (fail-closed); `list_hooks`
+            // would otherwise surface a "session not found" error that callers
+            // must distinguish from "no hooks".
+            if agent.session_local_extensions_disabled(&sid) != Some(false) {
                 return super::to_ext_response(Ok::<_, anyhow::Error>(
                     xai_hooks_plugins_types::HooksListResponse {
                         hooks: Vec::new(),
@@ -253,11 +256,20 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             let req: xai_hooks_plugins_types::HooksActionRequest = super::parse_params(args)?;
             let sid = acp::SessionId::new(req.session_id);
             // Refused rather than no-op'd: hook actions change trust and
-            // enablement state on disk, which other sessions read.
-            if agent.session_local_extensions_disabled(&sid) {
-                return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
-                    "hooks_action_refused",
-                ));
+            // enablement state on disk, which other sessions read. Unknown ids
+            // are refused with a distinct reason; see the plugins handler.
+            match agent.session_local_extensions_disabled(&sid) {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
+                        "hooks_action_refused",
+                    ));
+                }
+                None => {
+                    return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
+                        "unknown_session",
+                    ));
+                }
             }
 
             let result = agent

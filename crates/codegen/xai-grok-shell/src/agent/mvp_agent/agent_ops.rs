@@ -316,7 +316,7 @@ impl MvpAgent {
         // ordinary sessions: those may have populated it long before, so the
         // final state cannot say who initialized it. Tests take the delta
         // across a single session creation instead.
-        #[cfg(test)]
+        #[cfg(feature = "local-extensions-test-support")]
         self.ensure_plugin_registry_calls
             .set(self.ensure_plugin_registry_calls.get() + 1);
         if self.plugin_registry_initialized.replace(true) {
@@ -335,15 +335,52 @@ impl MvpAgent {
     }
     /// Read the latched built-in-tools-only policy for a live session.
     ///
-    /// The single read path for the applied-confirmation handshake and for
-    /// the `x.ai/*` extension gates. Deliberately reads the installed
-    /// [`SessionHandle`] rather than the value from the request, so a session
-    /// that failed to assemble reports `false`.
-    pub(crate) fn session_local_extensions_disabled(&self, session_id: &acp::SessionId) -> bool {
+    /// Three-state on purpose:
+    ///
+    /// - `Some(false)` — a live session that may use local extensions;
+    /// - `Some(true)`  — a live session restricted to built-in tools;
+    /// - `None`        — no such session: never created, already evicted, or
+    ///   racing its own teardown.
+    ///
+    /// Collapsing `None` into `false` would make every caller treat an unknown
+    /// session id as permissive, which is the wrong default for the callers
+    /// that exist: the extension endpoints would answer an unknown id from the
+    /// *shared* registry, and the handshake would confirm a policy for a
+    /// session that was never installed. Callers must decide explicitly, and
+    /// the extension gates all decide the same way — unknown means refuse.
+    ///
+    /// Reads the installed [`SessionHandle`] rather than the value from the
+    /// request, so a session that failed to assemble is never reported as
+    /// protected.
+    pub(crate) fn session_local_extensions_disabled(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<bool> {
         self.sessions
             .borrow()
             .get(session_id)
-            .is_some_and(|h| h.local_extensions_disabled)
+            .map(|h| h.local_extensions_disabled)
+    }
+    /// Number of [`Self::ensure_plugin_registry`] calls so far (T16b).
+    ///
+    /// Read-only observation point; tests take the delta across one session
+    /// creation rather than inspecting the shared registry's final state,
+    /// which cannot say *which* session populated it.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn ensure_plugin_registry_call_count(&self) -> u32 {
+        self.ensure_plugin_registry_calls.get()
+    }
+    /// Public read-only view of [`Self::session_local_extensions_disabled`].
+    ///
+    /// Exposed so the integration target can assert the three-state contract
+    /// (`Some(false)` / `Some(true)` / `None`) that the extension gates and
+    /// the handshake branch on, without widening the session map itself.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn session_local_extensions_disabled_snapshot(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<bool> {
+        self.session_local_extensions_disabled(session_id)
     }
     /// Fetch managed configs, merge with client servers, return merged list + earliest expiry.
     pub(super) async fn resolve_mcp_servers(
@@ -1511,7 +1548,7 @@ impl MvpAgent {
                 cfg.plugins.cli_plugin_dirs.clone(),
             ),
             plugin_registry_initialized: std::cell::Cell::new(false),
-            #[cfg(test)]
+            #[cfg(feature = "local-extensions-test-support")]
             ensure_plugin_registry_calls: std::cell::Cell::new(0),
             persona_io_summaries: cfg
                 .subagent_personas

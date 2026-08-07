@@ -1637,8 +1637,12 @@ pub(crate) async fn spawn_session_actor(
             current_prompt_id,
             pending_interactions,
             info: session_info,
-            // Same source as `rebuild_spec.local_extensions_disabled` above.
-            local_extensions_disabled,
+            // Read back off the spec rather than from the parameter again, so
+            // the two mirrors cannot drift: if this line and the spec ever
+            // disagree it will be because someone changed the spec, and this
+            // follows. T19 asserts the equality, but the structure is what
+            // makes it hold.
+            local_extensions_disabled: rebuild_spec.local_extensions_disabled,
             max_turns,
             hunk_tracker_handle,
             chat_state_handle: chat_state_handle_for_handle,

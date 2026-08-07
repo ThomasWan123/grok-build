@@ -254,6 +254,19 @@ impl MvpAgent {
             });
         }
     }
+    /// What a subagent validation context would inherit for `parent_session_id`
+    /// (T21): `(local_extensions_disabled, plugin_registry_is_some)`.
+    ///
+    /// The fail-closed rule for a missing parent is not observable from the
+    /// ACP wire — a `ValidateType` racing the parent's teardown cannot be
+    /// staged from outside — so it is asserted through this read-only point.
+    /// It builds the real context rather than re-deriving the answer, so the
+    /// test cannot pass while the production path diverges.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn subagent_validation_inheritance(&self, parent_session_id: &str) -> (bool, bool) {
+        let ctx = self.build_subagent_validation_context(parent_session_id);
+        (ctx.local_extensions_disabled, ctx.plugin_registry.is_some())
+    }
     /// Lightweight context for the `SubagentEvent::ValidateType` drain arm;
     /// tolerates evicted parent sessions (returns built-in defaults + warns).
     pub(super) fn build_subagent_validation_context(

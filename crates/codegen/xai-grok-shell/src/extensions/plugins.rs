@@ -135,36 +135,41 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/plugins/list" => {
             let req: ListRequest = super::parse_params(args)?;
 
-            // A known session answers from its own registry, which includes
-            // `_meta.pluginDirs` plugins. Only an unknown session (a pull
-            // before any session exists) falls back to the shared snapshot.
             let sid = acp::SessionId::new(req.session_id);
-            // Empty list rather than an error: the UI renders an empty state
-            // fine, whereas an error would force every caller to tell "no
-            // plugins" apart from "the call failed" — and callers that get
-            // that wrong tend to get it wrong in the permissive direction.
+            // A known session answers from its own registry, which includes
+            // `_meta.pluginDirs` plugins.
             //
-            // Note this also has to bypass the unknown-session fallback
-            // below, which would otherwise answer from the *shared* snapshot.
-            if agent.session_local_extensions_disabled(&sid) {
-                return super::to_ext_response(Ok::<_, anyhow::Error>(PluginsListResponse {
-                    plugins: Vec::new(),
-                }));
-            }
-            let registry = match agent.session_handle_waiting_for_load(&sid).await {
-                Some(handle) => handle.plugins_list().await,
-                None => agent.plugin_registry_snapshot(),
-            };
-            let response = match registry {
-                Some(registry) => {
-                    let plugins = registry
-                        .list()
-                        .iter()
-                        .map(|p| loaded_plugin_to_info(p))
-                        .collect();
-                    PluginsListResponse { plugins }
+            // The policy is read *after* awaiting the handle, not before: this
+            // helper waits for a session that is still loading, and checking
+            // first would report such a session as unknown and answer empty —
+            // a behaviour change for ordinary sessions, which is exactly what
+            // this batch must not do.
+            //
+            // An unknown session no longer falls back to the shared snapshot.
+            // That fallback existed for pulls made before any session exists,
+            // but it also means a client racing session teardown — or guessing
+            // an id — receives the machine's full plugin list. Empty is the
+            // fail-closed answer, and empty rather than an error because the
+            // UI renders an empty state fine whereas an error forces every
+            // caller to tell "no plugins" apart from "the call failed", a
+            // distinction callers tend to get wrong in the permissive
+            // direction.
+            let response = match agent.session_handle_waiting_for_load(&sid).await {
+                Some(handle) if !handle.local_extensions_disabled => {
+                    match handle.plugins_list().await {
+                        Some(registry) => PluginsListResponse {
+                            plugins: registry
+                                .list()
+                                .iter()
+                                .map(|p| loaded_plugin_to_info(p))
+                                .collect(),
+                        },
+                        None => PluginsListResponse {
+                            plugins: Vec::new(),
+                        },
+                    }
                 }
-                None => PluginsListResponse {
+                _ => PluginsListResponse {
                     plugins: Vec::new(),
                 },
             };
@@ -175,11 +180,23 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             let sid = acp::SessionId::new(req.session_id);
             // Refused, not silently ignored: `Reload` rebuilds the shared
             // registry and fans it out process-wide, so a caller that got an
-            // "ok" back would reasonably believe that happened.
-            if agent.session_local_extensions_disabled(&sid) {
-                return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
-                    "plugins_action_refused",
-                ));
+            // "ok" back would reasonably believe that happened. An unknown id
+            // is refused too — the reason distinguishes the two so the refusal
+            // stays diagnosable — and the pre-existing behaviour for an
+            // unknown id was already an error, so this changes its shape
+            // rather than its outcome.
+            match agent.session_local_extensions_disabled(&sid) {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
+                        "plugins_action_refused",
+                    ));
+                }
+                None => {
+                    return Err(crate::agent::mvp_agent::local_extensions_disabled_error(
+                        "unknown_session",
+                    ));
+                }
             }
 
             let result = agent

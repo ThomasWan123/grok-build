@@ -7,6 +7,19 @@ edition.workspace = true
 [features]
 default = []
 unstable = []
+# Read-only scaffolding for tests/local_extensions_disabled.rs.
+#
+# The crate's `--lib` unit tests do not build at this commit (upstream test
+# helpers such as `WorkspaceOps::for_test` and a cross-crate `#[cfg(test)]`
+# `MockEmbeddingProvider` are unreachable), so the policy's tests must be an
+# integration target — and an integration target links the library compiled
+# *without* `cfg(test)`, which is why this cannot be `#[cfg(test)]`.
+#
+# Kept deliberately narrow: it exposes observation points only (a call
+# counter, a three-state policy read, the subagent inheritance decision) and
+# must never gate behaviour. Off by default, so production builds are
+# unaffected.
+local-extensions-test-support = []
 default-bazel = [
     ]
 
