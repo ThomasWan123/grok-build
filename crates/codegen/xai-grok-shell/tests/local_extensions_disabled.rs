@@ -31,7 +31,32 @@ const APPLIED: &str = "localExtensionsDisabledApplied";
 ///
 /// `XAI_API_KEY` is what makes `initialize` select a default auth method; the
 /// key is never used for a request because no test here runs a turn.
+/// A plugin on disk that contributes both a hook and an MCP server, so a
+/// registry built from it is unmistakably non-empty.
+///
+/// Tests that assert "nothing was installed" are only worth running when
+/// something *could* have been: with no plugin anywhere, every such assertion
+/// passes for the wrong reason.
+fn plugin_fixture(name: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("plugin dir");
+    std::fs::write(
+        dir.path().join("plugin.json"),
+        format!(r#"{{"name": "{name}"}}"#),
+    )
+    .expect("plugin.json");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        r#"{"mcpServers":{"fixture-srv":{"command":"echo","args":["hi"]}}}"#,
+    )
+    .expect(".mcp.json");
+    dir
+}
+
 fn agent() -> (MvpAgent, tempfile::TempDir) {
+    agent_with_plugins(&[])
+}
+
+fn agent_with_plugins(plugin_dirs: &[&std::path::Path]) -> (MvpAgent, tempfile::TempDir) {
     let temp = tempfile::tempdir().expect("temp dir");
     unsafe {
         std::env::set_var("XAI_API_KEY", "test-key");
@@ -43,7 +68,8 @@ fn agent() -> (MvpAgent, tempfile::TempDir) {
     ));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let gateway = xai_acp_lib::AcpAgentGatewaySender::new(tx);
-    let cfg = xai_grok_shell::agent::config::Config::default();
+    let mut cfg = xai_grok_shell::agent::config::Config::default();
+    cfg.plugins.cli_plugin_dirs = plugin_dirs.iter().map(|p| p.to_path_buf()).collect();
     let agent = MvpAgent::new(gateway, &cfg, auth, None).expect("valid test config");
     (agent, temp)
 }
@@ -384,7 +410,8 @@ local_test!(t24_unknown_session_ids_fail_closed, async {
 // ---------------------------------------------------------------------------
 
 local_test!(t5_ordinary_session_unaffected_alongside_disabled, async {
-    let (a, tmp) = agent();
+    let fixture = plugin_fixture("t5-fixture-plugin");
+    let (a, tmp) = agent_with_plugins(&[fixture.path()]);
     init(&a).await;
     let disabled_cwd = tempfile::tempdir().expect("cwd");
     let disabled = disabled_session(&a, disabled_cwd.path()).await;
@@ -399,8 +426,9 @@ local_test!(t5_ordinary_session_unaffected_alongside_disabled, async {
         Some(true)
     );
 
-    // The ordinary session still answers from its own registry rather than
-    // being caught by the policy branch.
+    // The ordinary session sees the fixture, through the endpoint and on its
+    // actor. Asserting a positive here is the point: "no plugins anywhere"
+    // would satisfy a test that only checked the restricted session.
     let plugins = ext(
         &a,
         "x.ai/plugins/list",
@@ -408,20 +436,31 @@ local_test!(t5_ordinary_session_unaffected_alongside_disabled, async {
     )
     .await
     .expect("plugins/list");
-    assert!(plugins.get("plugins").is_some());
+    assert_eq!(
+        plugins["plugins"].as_array().map(Vec::len),
+        Some(1),
+        "the ordinary session must still see the fixture plugin"
+    );
+    assert_eq!(a.session_raw_plugin_registry(&ordinary).await, Some(Some(1)));
 
-    // And its extension actions are not refused by the policy gate.
-    let err = ext(
+    // Its extension actions must *succeed*, not merely fail differently. An
+    // earlier revision accepted any non-policy error here, which would have
+    // passed even if the endpoint were broken outright.
+    ext(
         &a,
         "x.ai/plugins/action",
         serde_json::json!({ "sessionId": ordinary.0, "action": { "type": "reload" } }),
     )
     .await
-    .err();
-    if let Some(e) = err {
-        let data = err_data(&e);
-        assert_ne!(data["code"], "local_extensions_disabled", "{data}");
-    }
+    .expect("an ordinary session's plugin action must succeed");
+    assert_eq!(
+        a.session_raw_plugin_registry(&ordinary).await,
+        Some(Some(1)),
+        "and must leave it with a working registry"
+    );
+
+    // Meanwhile the restricted session is unchanged, actor included.
+    assert_eq!(a.session_raw_plugin_registry(&disabled).await, Some(None));
 });
 
 // ---------------------------------------------------------------------------
@@ -429,7 +468,8 @@ local_test!(t5_ordinary_session_unaffected_alongside_disabled, async {
 // ---------------------------------------------------------------------------
 
 local_test!(t22_global_reload_requires_an_eligible_session, async {
-    let (a, tmp) = agent();
+    let fixture = plugin_fixture("t22-fixture-plugin");
+    let (a, tmp) = agent_with_plugins(&[fixture.path()]);
     init(&a).await;
 
     // Only a built-in-tools-only session exists: nobody could consume the
@@ -439,32 +479,54 @@ local_test!(t22_global_reload_requires_an_eligible_session, async {
         .await
         .expect_err("reload must be refused when no session may use plugins");
     assert_eq!(err_data(&err)["reason"], "no_eligible_session");
+    assert_eq!(
+        a.session_raw_plugin_registry(&disabled).await,
+        Some(None),
+        "a refused reload must not have installed anything"
+    );
 
     // Add an ordinary session and the same call succeeds — the endpoint stays
     // usable for the sessions it exists for.
     let ordinary_cwd = tempfile::tempdir().expect("cwd");
-    let _ordinary = ordinary_session(&a, ordinary_cwd.path()).await;
+    let ordinary = ordinary_session(&a, ordinary_cwd.path()).await;
     ext(&a, "x.ai/plugins/reload", serde_json::json!({}))
         .await
         .expect("reload must succeed once an eligible session exists");
 
-    // …and the fan-out it triggers still does not reach the disabled session.
-    let plugins = ext(
-        &a,
-        "x.ai/plugins/list",
-        serde_json::json!({ "sessionId": disabled.0 }),
-    )
-    .await
-    .expect("plugins/list");
-    assert_eq!(plugins, serde_json::json!({ "plugins": [] }));
-    let hooks = ext(
-        &a,
-        "x.ai/hooks/list",
-        serde_json::json!({ "sessionId": disabled.0 }),
-    )
-    .await
-    .expect("hooks/list");
-    assert_eq!(hooks["hooks"], serde_json::json!([]));
+    // Positive side: the eligible session's registry really was rebuilt.
+    assert_eq!(
+        a.session_raw_plugin_registry(&ordinary).await,
+        Some(Some(1)),
+        "the reload must have reached the session it exists for"
+    );
+
+    // Negative side: the restricted session's actor is still registry-free —
+    // checked past the endpoint, which would report empty either way.
+    assert_eq!(
+        a.session_raw_plugin_registry(&disabled).await,
+        Some(None),
+        "the fan-out must not have installed a registry on the protected session"
+    );
+    assert_eq!(
+        ext(
+            &a,
+            "x.ai/plugins/list",
+            serde_json::json!({ "sessionId": disabled.0 }),
+        )
+        .await
+        .expect("plugins/list"),
+        serde_json::json!({ "plugins": [] }),
+    );
+    assert_eq!(
+        ext(
+            &a,
+            "x.ai/hooks/list",
+            serde_json::json!({ "sessionId": disabled.0 }),
+        )
+        .await
+        .expect("hooks/list")["hooks"],
+        serde_json::json!([]),
+    );
 });
 
 // ---------------------------------------------------------------------------
@@ -472,7 +534,8 @@ local_test!(t22_global_reload_requires_an_eligible_session, async {
 // ---------------------------------------------------------------------------
 
 local_test!(t3_broadcast_does_not_reach_disabled_session, async {
-    let (a, tmp) = agent();
+    let fixture = plugin_fixture("t3-fixture-plugin");
+    let (a, tmp) = agent_with_plugins(&[fixture.path()]);
     init(&a).await;
     let disabled_cwd = tempfile::tempdir().expect("cwd");
     let disabled = disabled_session(&a, disabled_cwd.path()).await;
@@ -493,17 +556,31 @@ local_test!(t3_broadcast_does_not_reach_disabled_session, async {
     .await
     .expect("the ordinary session's reload must succeed, or this proves nothing");
 
-    let plugins = ext(
-        &a,
-        "x.ai/plugins/list",
-        serde_json::json!({ "sessionId": disabled.0 }),
-    )
-    .await
-    .expect("plugins/list");
+    // The ordinary session really did pick the fixture up, so the broadcast
+    // carried something worth blocking.
     assert_eq!(
-        plugins,
+        a.session_raw_plugin_registry(&ordinary).await,
+        Some(Some(1)),
+        "the reload must have installed the fixture on the ordinary session"
+    );
+
+    // Asked of the actor, not of the endpoint. The endpoint returns an empty
+    // list for this session unconditionally, so a wire-only assertion here
+    // would stay green even if the broadcast had installed a registry.
+    assert_eq!(
+        a.session_raw_plugin_registry(&disabled).await,
+        Some(None),
+        "the protected session's actor must hold no registry at all"
+    );
+    assert_eq!(
+        ext(
+            &a,
+            "x.ai/plugins/list",
+            serde_json::json!({ "sessionId": disabled.0 }),
+        )
+        .await
+        .expect("plugins/list"),
         serde_json::json!({ "plugins": [] }),
-        "a reload driven by another session must not reach this one"
     );
     assert_eq!(
         a.session_local_extensions_disabled_snapshot(&disabled),

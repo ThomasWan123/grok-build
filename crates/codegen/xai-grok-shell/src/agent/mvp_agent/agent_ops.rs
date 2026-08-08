@@ -370,6 +370,23 @@ impl MvpAgent {
     pub fn ensure_plugin_registry_call_count(&self) -> u32 {
         self.ensure_plugin_registry_calls.get()
     }
+    /// The session actor's **own** plugin registry, asked of the actor itself.
+    ///
+    /// `None` — no such session. `Some(None)` — the actor holds no registry.
+    /// `Some(Some(n))` — the actor holds a registry of `n` plugins.
+    ///
+    /// Needed because the `x.ai/plugins/list` endpoint returns an empty list
+    /// for a restricted session *at the endpoint*, so a test driven through
+    /// the wire would stay green even if a broadcast had in fact installed a
+    /// registry on the actor. This asks past the endpoint.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub async fn session_raw_plugin_registry(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<Option<usize>> {
+        let handle = self.sessions.borrow().get(session_id).cloned()?;
+        Some(handle.plugins_list().await.map(|r| r.list().len()))
+    }
     /// Public read-only view of [`Self::session_local_extensions_disabled`].
     ///
     /// Exposed so the integration target can assert the three-state contract
