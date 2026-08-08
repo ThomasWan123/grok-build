@@ -1912,3 +1912,132 @@ local_test!(t23_ordinary_session_still_runs_extension_commands, async {
         refusal_meta(&notes)
     );
 });
+
+// ---------------------------------------------------------------------------
+// T23b — the dispatch guard, exercised through the real dispatch
+//
+// T23a proves these commands are never offered. This proves the guard behind
+// that: with every gate forced open, each arm still refuses, and refuses before
+// doing anything. The test never restates which commands are extension
+// commands — it drives the production path and reads the production output, so
+// removing an arm from the guard's list makes the corresponding case fail.
+// ---------------------------------------------------------------------------
+
+/// Command texts with arguments their parser accepts.
+///
+/// Syntax matters here: `install` / `add` / `remove` and friends resolve to a
+/// different action (or fail to resolve at all) without an argument, and a
+/// command that never reaches the guard would pass this test while proving
+/// nothing about it.
+const EXTENSION_COMMAND_CASES: &[&str] = &[
+    "/hooks-trust",
+    "/hooks-list",
+    "/hooks-add C:/tmp/led-hook.json",
+    "/hooks-remove C:/tmp/led-hook.json",
+    "/hooks-untrust",
+    "/plugins list",
+    "/plugins reload",
+    "/plugins trust C:/tmp/led-plugin",
+    "/plugins add C:/tmp/led-plugin",
+    "/plugins remove C:/tmp/led-plugin",
+    "/plugins install C:/tmp/led-plugin",
+    "/plugins uninstall led-plugin",
+    "/plugins update led-plugin",
+];
+
+/// Everything a refused command must leave untouched.
+#[derive(Debug, PartialEq)]
+struct SideEffectSnapshot {
+    plugin_registry: Option<Option<usize>>,
+    hooks: serde_json::Value,
+    mcp_hits: usize,
+    sentinel_files: Vec<String>,
+}
+
+async fn snapshot(
+    a: &MvpAgent,
+    sid: &acp::SessionId,
+    mcp: &Arc<Mutex<Hits>>,
+    sentinel_dir: &std::path::Path,
+) -> SideEffectSnapshot {
+    let mut sentinel_files: Vec<String> = std::fs::read_dir(sentinel_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    sentinel_files.sort();
+    SideEffectSnapshot {
+        plugin_registry: a.session_raw_plugin_registry(sid).await,
+        hooks: ext(a, "x.ai/hooks/list", serde_json::json!({ "sessionId": sid.0 }))
+            .await
+            .expect("hooks/list"),
+        mcp_hits: {
+            let h = mcp.lock().unwrap();
+            h.initialize.values().sum::<usize>() + h.managed_configs
+        },
+        sentinel_files,
+    }
+}
+
+local_test!(t23b_every_extension_arm_refuses_before_acting, async {
+    let (mcp_base, mcp_hits) = spawn_mcp_fixture().await;
+    let (model_url, model_hits) = spawn_mock_model().await;
+    // A plugin directory the `add` / `install` / `trust` arms would plausibly
+    // write into, so "no side effect" is a claim with something behind it.
+    let sentinel_dir = tempfile::tempdir().expect("sentinel dir");
+    let (a, tmp) = agent_with_model(&model_url);
+    let notes = spawn_notification_collector();
+    init(&a).await;
+    let sid = disabled_session(&a, tmp.path()).await;
+    let _ = mcp_base;
+
+    for cmd in EXTENSION_COMMAND_CASES {
+        let before = snapshot(&a, &sid, &mcp_hits, sentinel_dir.path()).await;
+        let model_before = model_hits.load(std::sync::atomic::Ordering::SeqCst);
+        let notes_before = notes.lock().unwrap().len();
+
+        a.test_execute_slash_command(&sid, cmd).await;
+
+        // Bounded: the refusal is emitted on the notification channel, which is
+        // asynchronous even though dispatch has returned.
+        let arrived = wait_for(|| {
+            notes.lock().unwrap()[notes_before..]
+                .iter()
+                .any(|n| n.pointer("/update/content/_meta").is_some())
+        })
+        .await;
+
+        let refusals: Vec<serde_json::Value> = notes.lock().unwrap()[notes_before..]
+            .iter()
+            .filter_map(|n| n.pointer("/update/content/_meta").cloned())
+            .collect();
+        assert!(arrived, "{cmd}: no refusal notification arrived");
+        assert_eq!(
+            refusals.len(),
+            1,
+            "{cmd}: expected exactly one refusal, got {refusals:?}"
+        );
+        assert_eq!(
+            refusals[0]["code"], "local_extensions_disabled",
+            "{cmd}: wrong code"
+        );
+        assert_eq!(
+            refusals[0]["policy"], "local_extensions_disabled",
+            "{cmd}: wrong policy"
+        );
+        assert_eq!(
+            refusals[0]["reason"], "slash_command_refused",
+            "{cmd}: wrong reason"
+        );
+
+        assert_eq!(
+            model_hits.load(std::sync::atomic::Ordering::SeqCst),
+            model_before,
+            "{cmd}: a refused command must not run a model turn"
+        );
+        let after = snapshot(&a, &sid, &mcp_hits, sentinel_dir.path()).await;
+        assert_eq!(after, before, "{cmd}: a refused command must change nothing");
+    }
+});

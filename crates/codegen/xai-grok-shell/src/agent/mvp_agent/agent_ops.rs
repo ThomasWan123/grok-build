@@ -396,6 +396,15 @@ impl MvpAgent {
             barrier.hold().await;
         }
     }
+    /// Run a slash command on a live session through the production dispatch,
+    /// bypassing the advertisement gate (test-only).
+    #[cfg(feature = "local-extensions-test-support")]
+    pub async fn test_execute_slash_command(&self, session_id: &acp::SessionId, command: &str) {
+        let handle = self.sessions.borrow().get(session_id).cloned();
+        if let Some(handle) = handle {
+            handle.test_execute_slash_command(command).await;
+        }
+    }
     /// The session actor's **own** plugin registry, asked of the actor itself.
     ///
     /// `None` — no such session. `Some(None)` — the actor holds no registry.

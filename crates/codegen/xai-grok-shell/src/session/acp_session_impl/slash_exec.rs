@@ -1,5 +1,30 @@
 use super::*;
 
+/// Commands that manage local extensions.
+///
+/// A single list, consulted by the guard below. Kept as a function rather than
+/// inlined so a test can exercise the guard through the real dispatch without
+/// restating the set — a restated set would agree with itself no matter what
+/// the guard actually does.
+fn is_extension_command(action: &BuiltinAction) -> bool {
+    matches!(
+        action,
+        BuiltinAction::HooksTrust
+            | BuiltinAction::HooksList
+            | BuiltinAction::HooksAdd { .. }
+            | BuiltinAction::HooksRemove { .. }
+            | BuiltinAction::HooksUntrust
+            | BuiltinAction::PluginsList
+            | BuiltinAction::PluginsReload
+            | BuiltinAction::PluginsTrust
+            | BuiltinAction::PluginsAdd { .. }
+            | BuiltinAction::PluginsRemove { .. }
+            | BuiltinAction::PluginsInstall { .. }
+            | BuiltinAction::PluginsUninstall { .. }
+            | BuiltinAction::PluginsUpdate { .. }
+    )
+}
+
 impl SessionActor {
     /// Execute a built-in slash command (e.g. `/compact`, `/yolo`).
     pub(super) async fn execute_builtin_slash_command(
@@ -18,24 +43,7 @@ impl SessionActor {
         // the read-only ones: `/plugins install`, `add`, `remove`, `update`
         // and `trust` mutate global plugin state that other sessions on this
         // connection consume, and this session must not be the one to do that.
-        if self.rebuild_spec.local_extensions_disabled
-            && matches!(
-                action,
-                BuiltinAction::HooksTrust
-                    | BuiltinAction::HooksList
-                    | BuiltinAction::HooksAdd { .. }
-                    | BuiltinAction::HooksRemove { .. }
-                    | BuiltinAction::HooksUntrust
-                    | BuiltinAction::PluginsList
-                    | BuiltinAction::PluginsReload
-                    | BuiltinAction::PluginsTrust
-                    | BuiltinAction::PluginsAdd { .. }
-                    | BuiltinAction::PluginsRemove { .. }
-                    | BuiltinAction::PluginsInstall { .. }
-                    | BuiltinAction::PluginsUninstall { .. }
-                    | BuiltinAction::PluginsUpdate { .. }
-            )
-        {
+        if self.rebuild_spec.local_extensions_disabled && is_extension_command(&action) {
             tracing::info!(
                 session_id = %self.session_info.id.0, command = action.command_name(),
                 "local_extensions_disabled: refusing extension slash command"

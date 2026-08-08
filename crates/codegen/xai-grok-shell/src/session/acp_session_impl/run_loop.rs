@@ -683,7 +683,46 @@ pub(super) async fn run_session(
             .send(resp); }); } SessionCommand::PersistFeedback(entry) => { let _ =
             session.notifications.persistence_tx.send(PersistenceMsg::Feedback(* entry));
             } SessionCommand::AdvertiseCommands => { session
-            .send_available_commands_update(). await; } SessionCommand::ReloadSkills => {
+            .send_available_commands_update(). await; }
+            #[cfg(feature = "local-extensions-test-support")]
+            SessionCommand::TestExecuteSlashCommand { command_text, respond_to } => {
+                // Resolution uses the real command table with every gate open,
+                // which is the point: the advertisement gate already hides these
+                // commands from a restricted session, and what needs proving is
+                // that the dispatch guard holds even when something reaches it
+                // anyway. No policy decision is made here and no payload is
+                // built — whatever the production path emits, it emits on its
+                // own channels.
+                let blocks = vec![
+                    agent_client_protocol::ContentBlock::Text(
+                        agent_client_protocol::TextContent::new(command_text),
+                    ),
+                ];
+                if let Err(crate::session::slash_commands::SlashCommandOutcome::Builtin(action)) =
+                    crate::session::slash_commands::resolve(
+                        blocks,
+                        &[],
+                        // Every gate open. `CommandAvailability::all_enabled()`
+                        // is `#[cfg(test)]`-only and `slash_commands.rs` is not
+                        // in this batch's whitelist, so the equivalent literal
+                        // is built here instead. A new gate field will fail to
+                        // compile rather than silently default to closed.
+                        crate::session::slash_commands::CommandAvailability {
+                            feedback: true,
+                            memory: true,
+                            memory_configured: true,
+                            scheduler: true,
+                            hooks: true,
+                            plugins: true,
+                            goal: true,
+                        },
+                        crate::session::slash_commands::SkillSlashRewrite::RewriteToRun,
+                    )
+                {
+                    let _ = session.execute_builtin_slash_command(action).await;
+                }
+                let _ = respond_to.send(());
+            } SessionCommand::ReloadSkills => {
             let s = session.clone(); tokio::task::spawn_local(async move { s
             .reload_skills_from_disk(). await; }); }
             SessionCommand::DispatchSessionStartHook { source } => { let envelope =

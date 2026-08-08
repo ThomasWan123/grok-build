@@ -602,6 +602,20 @@ pub enum SessionCommand {
     /// files and is included in GCS CopyFile snapshots.
     PersistFeedback(Box<crate::session::persistence::LocalFeedbackEntry>),
     AdvertiseCommands,
+    /// Run a slash command through the production dispatch, bypassing the
+    /// advertisement gate. Test-only.
+    ///
+    /// Carries the raw text and nothing else: resolution uses the real command
+    /// table, and the outcome is whatever the production path emits on its own
+    /// channels. `respond_to` fires when dispatch returns, so a test can wait
+    /// for completion instead of polling — it deliberately carries no result,
+    /// because a second way of expressing the outcome would be a second thing
+    /// to keep correct.
+    #[cfg(feature = "local-extensions-test-support")]
+    TestExecuteSlashCommand {
+        command_text: String,
+        respond_to: oneshot::Sender<()>,
+    },
     /// Re-discover skills from disk, update the SkillManager baseline,
     /// and re-advertise slash commands to the client.
     ReloadSkills,

@@ -179,6 +179,25 @@ pub struct SessionHandle {
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
 }
 impl SessionHandle {
+    /// Run a slash command through the production dispatch (test-only).
+    ///
+    /// Resolves and returns once dispatch has returned; the command's own
+    /// output travels the ordinary notification channel, so callers observe it
+    /// exactly where a client would.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub async fn test_execute_slash_command(&self, command_text: &str) {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(SessionCommand::TestExecuteSlashCommand {
+                command_text: command_text.to_string(),
+                respond_to: tx,
+            })
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+    }
     /// Last assistant `model_id` / `model_fingerprint` in conversation (global, not turn-scoped).
     pub(crate) async fn get_model_metadata(&self) -> xai_chat_state::ModelMetadata {
         let (tx, rx) = oneshot::channel();
