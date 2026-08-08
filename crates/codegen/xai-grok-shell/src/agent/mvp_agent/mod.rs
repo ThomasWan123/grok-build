@@ -126,12 +126,20 @@ pub(crate) const LOCAL_EXTENSIONS_DISABLED_META_KEY: &str = "x.ai/localExtension
 /// only that a policy bit is set, and must not pretend to know how the client
 /// labels its session kinds.
 pub(crate) fn local_extensions_disabled_error(reason: &str) -> acp::Error {
-    acp::Error::invalid_request()
-        .data(serde_json::json!({
-            "code": "local_extensions_disabled",
-            "policy": "local_extensions_disabled",
-            "reason": reason,
-        }))
+    acp::Error::invalid_request().data(local_extensions_disabled_payload(reason))
+}
+/// The refusal payload itself.
+///
+/// Split out because not every refusal can travel as an `acp::Error`: a slash
+/// command is refused *inside* a turn and its only channel back is a message
+/// chunk. Both carry this same object so a client can recognise the refusal
+/// without caring which path it arrived on.
+pub(crate) fn local_extensions_disabled_payload(reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "code": "local_extensions_disabled",
+        "policy": "local_extensions_disabled",
+        "reason": reason,
+    })
 }
 /// Parse the built-in-tools-only policy out of session `_meta`.
 ///

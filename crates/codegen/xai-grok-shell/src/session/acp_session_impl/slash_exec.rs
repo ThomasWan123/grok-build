@@ -40,8 +40,24 @@ impl SessionActor {
                 session_id = %self.session_info.id.0, command = action.command_name(),
                 "local_extensions_disabled: refusing extension slash command"
             );
-            self.send_slash_command_output(
-                "Local extensions are disabled for this session.",
+            // Structured, not just prose. A slash command is refused inside a
+            // turn, so it cannot come back as an `acp::Error` — but a client
+            // must still be able to tell "refused by policy" from any other
+            // message, and matching on text is not a contract. The payload is
+            // the same one the extension endpoints return; it rides on the
+            // content block's own `_meta`.
+            let payload = crate::agent::mvp_agent::local_extensions_disabled_payload(
+                "slash_command_refused",
+            );
+            let mut text = acp::TextContent::new(
+                "Local extensions are disabled for this session.".to_string(),
+            );
+            text.meta = payload.as_object().cloned();
+            self.send_update(
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(text),
+                )),
+                None,
             )
             .await;
             return ok_end_turn(0, None);

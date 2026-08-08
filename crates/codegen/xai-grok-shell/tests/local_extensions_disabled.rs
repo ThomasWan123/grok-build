@@ -1698,6 +1698,13 @@ fn mock_catalog(base_url: &str) -> indexmap::IndexMap<String, xai_grok_shell::ag
 /// reach a local model endpoint, and the tests that do not run a turn have no
 /// reason to carry one.
 fn agent_with_model(model_url: &str) -> (MvpAgent, tempfile::TempDir) {
+    agent_with_model_and_plugins(model_url, &[])
+}
+
+fn agent_with_model_and_plugins(
+    model_url: &str,
+    plugin_dirs: &[&std::path::Path],
+) -> (MvpAgent, tempfile::TempDir) {
     scratch_home();
     let temp = tempfile::tempdir().expect("temp dir");
     seed_fresh_xai_oidc_auth(temp.path());
@@ -1708,7 +1715,8 @@ fn agent_with_model(model_url: &str) -> (MvpAgent, tempfile::TempDir) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     GATEWAY_RX.with(|slot| *slot.borrow_mut() = Some(rx));
     let gateway = xai_acp_lib::AcpAgentGatewaySender::new(tx);
-    let cfg = xai_grok_shell::agent::config::Config::default();
+    let mut cfg = xai_grok_shell::agent::config::Config::default();
+    cfg.plugins.cli_plugin_dirs = plugin_dirs.iter().map(|p| p.to_path_buf()).collect();
     let agent = MvpAgent::new(gateway, &cfg, auth, Some(mock_catalog(model_url)))
         .expect("valid test config");
     (agent, temp)
@@ -1738,5 +1746,169 @@ local_test!(turn_harness_completes_a_prompt, async {
         model_hits.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "the turn must have reached the mock model"
+    );
+});
+
+// ---------------------------------------------------------------------------
+// T23 — every `/hooks` and `/plugins` arm is refused, structurally
+//
+// Each command is given syntactically valid arguments. A malformed one would
+// be rejected during parsing, and "the command did not run" is not the claim
+// being tested — a parse failure would look identical to a policy refusal from
+// the outside, which is why the assertion is on the refusal *payload* rather
+// than on the absence of an effect.
+// ---------------------------------------------------------------------------
+
+/// Collects `session/update` notifications off the gateway.
+fn spawn_notification_collector() -> Arc<Mutex<Vec<serde_json::Value>>> {
+    use xai_acp_lib::AcpClientMessage;
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut rx = GATEWAY_RX
+        .with(|slot| slot.borrow_mut().take())
+        .expect("gateway receiver was taken twice");
+    let sink = seen.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(msg) = rx.recv().await {
+            if let AcpClientMessage::SessionNotification(args) = msg {
+                if let Ok(v) = serde_json::to_value(&args.request) {
+                    sink.lock().unwrap().push(v);
+                }
+                let _ = args.response_tx.send(Ok(()));
+            }
+        }
+    });
+    seen
+}
+
+/// The refusal payload carried on an agent message chunk, if any.
+fn refusal_meta(notifications: &Arc<Mutex<Vec<serde_json::Value>>>) -> Vec<serde_json::Value> {
+    notifications
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.pointer("/update/content/_meta").cloned())
+        .filter(|m| m.get("code").and_then(|c| c.as_str()) == Some("local_extensions_disabled"))
+        .collect()
+}
+
+/// Every extension arm, with arguments its parser accepts.
+const EXTENSION_COMMANDS: &[&str] = &[
+    "/hooks-trust",
+    "/hooks-list",
+    "/hooks-add C:/tmp/led-hook.json",
+    "/hooks-remove C:/tmp/led-hook.json",
+    "/hooks-untrust",
+    "/plugins list",
+    "/plugins reload",
+    "/plugins trust C:/tmp/led-plugin",
+    "/plugins add C:/tmp/led-plugin",
+    "/plugins remove C:/tmp/led-plugin",
+    "/plugins install C:/tmp/led-plugin",
+    "/plugins uninstall led-plugin",
+    "/plugins update led-plugin",
+];
+
+/// Command names the session advertises, from an `available_commands_update`.
+fn advertised_commands(notifications: &Arc<Mutex<Vec<serde_json::Value>>>) -> Vec<String> {
+    notifications
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|n| n.pointer("/update/availableCommands").cloned())
+        .map(|cmds| {
+            cmds.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.get("name").and_then(|v| v.as_str()))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+fn extension_command_names(names: &[String]) -> Vec<&String> {
+    names
+        .iter()
+        .filter(|n| n.starts_with("hooks") || n.starts_with("plugin"))
+        .collect()
+}
+
+local_test!(t23_extension_commands_are_not_offered_to_a_restricted_session, async {
+    let (model_url, _hits) = spawn_mock_model().await;
+    let (a, tmp) = agent_with_model(&model_url);
+    let notes = spawn_notification_collector();
+    init(&a).await;
+    let sid = disabled_session(&a, tmp.path()).await;
+
+    // Drive one turn so the command catalog is published.
+    a.prompt(acp::PromptRequest::new(
+        sid.clone(),
+        vec![acp::ContentBlock::from("hello")],
+    ))
+    .await
+    .expect("prompt");
+
+    let names = advertised_commands(&notes);
+    assert!(
+        !names.is_empty(),
+        "the session must advertise some commands, or this asserts nothing"
+    );
+    assert!(
+        extension_command_names(&names).is_empty(),
+        "a restricted session must offer no hooks/plugins command; got {names:?}"
+    );
+});
+
+local_test!(t23_extension_commands_are_offered_to_an_ordinary_session, async {
+    let fixture = plugin_fixture("t23-fixture-plugin");
+    let (model_url, _hits) = spawn_mock_model().await;
+    // Same shape as `agent_with_model`, plus a plugin so the `plugins` gate has
+    // something to open on. Without it "no plugins command" would be the
+    // expected answer for an ordinary session too, and the negative test above
+    // would prove nothing.
+    let (a, tmp) = agent_with_model_and_plugins(&model_url, &[fixture.path()]);
+    let notes = spawn_notification_collector();
+    init(&a).await;
+    let sid = ordinary_session(&a, tmp.path()).await;
+
+    a.prompt(acp::PromptRequest::new(
+        sid.clone(),
+        vec![acp::ContentBlock::from("hello")],
+    ))
+    .await
+    .expect("prompt");
+
+    let names = advertised_commands(&notes);
+    assert!(
+        !extension_command_names(&names).is_empty(),
+        "an ordinary session with a plugin installed must offer the extension          commands; got {names:?}"
+    );
+});
+
+
+local_test!(t23_ordinary_session_still_runs_extension_commands, async {
+    let fixture = plugin_fixture("t23-control-plugin");
+    let (model_url, _model_hits) = spawn_mock_model().await;
+    let (a, tmp) = agent_with_model_and_plugins(&model_url, &[fixture.path()]);
+    let notes = spawn_notification_collector();
+    init(&a).await;
+    let sid = ordinary_session(&a, tmp.path()).await;
+
+    // Read-only, so the control is non-destructive; the point is only that the
+    // policy branch is not a global kill switch.
+    a.prompt(acp::PromptRequest::new(
+        sid.clone(),
+        vec![acp::ContentBlock::from("/plugins list")],
+    ))
+    .await
+    .expect("an ordinary session must still run /plugins list");
+
+    assert!(
+        refusal_meta(&notes).is_empty(),
+        "an ordinary session must not see a policy refusal; got {:?}",
+        refusal_meta(&notes)
     );
 });
