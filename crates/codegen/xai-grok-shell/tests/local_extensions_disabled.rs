@@ -116,25 +116,45 @@ fn seed_fresh_xai_oidc_auth(dir: &std::path::Path) {
 }
 
 #[allow(dead_code)]
+/// Point `GROK_HOME` at a scratch directory, exactly once per process.
+///
+/// This is the only environment write left in the file, and it is deliberately
+/// *not* on the per-agent path. Writing the environment while other threads
+/// run is unsound — an earlier revision set `GROK_HOME`, `XAI_API_KEY` and the
+/// proxy URL on every `agent_full` call, and building a second agent aborted
+/// the process with STATUS_HEAP_CORRUPTION because the first agent's reqwest
+/// and MCP workers were reading the environment block concurrently.
+///
+/// Running once, at the first construction and before any agent thread exists,
+/// removes the race. `GROK_HOME` has no API-level equivalent (unlike the auth
+/// directory, which `AuthManager::new` takes directly), so leaving it unset
+/// would put session files in the developer's real `~/.grok`.
+///
+/// Child processes get theirs via `Command::env` instead, which never touches
+/// this process at all.
+fn scratch_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("scratch home");
+        // SAFETY: runs once, at the first agent construction, before any agent
+        // has spawned a thread that reads the environment.
+        unsafe { std::env::set_var("GROK_HOME", dir.path()) };
+        dir
+    })
+    .path()
+}
+
 fn agent_full(
     plugin_dirs: &[&std::path::Path],
     managed_proxy_url: Option<&str>,
 ) -> (MvpAgent, tempfile::TempDir) {
+    let _ = scratch_home();
     let temp = tempfile::tempdir().expect("temp dir");
-    if managed_proxy_url.is_some() {
-        seed_fresh_xai_oidc_auth(temp.path());
-    }
-    unsafe {
-        std::env::set_var("XAI_API_KEY", "test-key");
-        std::env::set_var("GROK_HOME", temp.path());
-        // `MvpAgent::new` re-resolves the config through `resolve_config`, which
-        // rebuilds `endpoints` from env/disk — so the proxy URL has to be set
-        // where that resolution can see it, not only on the struct we pass in.
-        match managed_proxy_url {
-            Some(url) => std::env::set_var("GROK_CLI_CHAT_PROXY_BASE_URL", url),
-            None => std::env::remove_var("GROK_CLI_CHAT_PROXY_BASE_URL"),
-        }
-    }
+    // Every agent gets a credential, not just the managed ones: it is also what
+    // makes `initialize` select a default auth method, which `session/new`
+    // requires. Doing it here instead of exporting `XAI_API_KEY` keeps this
+    // function free of process-environment writes.
+    seed_fresh_xai_oidc_auth(temp.path());
     let auth = std::sync::Arc::new(xai_grok_shell::auth::AuthManager::new(
         temp.path(),
         xai_grok_shell::auth::GrokComConfig::default(),
@@ -1436,21 +1456,26 @@ local_test!(t17_e2_managed_mcp_control_and_data_plane, async {
     );
 });
 
-// T16-E2 — NOT YET IMPLEMENTED. The negative half needs a *second*, separately
-// cached `MvpAgent` (a shared cache would let "zero fetches" be a cache hit
-// rather than a policy decision), and building one in the same process
-// currently aborts with STATUS_HEAP_CORRUPTION.
+// T16-E2 — NOT YET GREEN. Shape is settled and the blocking UB is gone; what
+// remains is a child-process harness problem, recorded here rather than left as
+// a hanging test.
 //
-// The cause is in this test harness, not the engine: `agent_full` sets
-// `GROK_HOME` / `GROK_CLI_CHAT_PROXY_BASE_URL` through `std::env::set_var`,
-// which is unsound once other threads exist — and the first agent's reqwest and
-// MCP worker threads are still alive and do read the environment. Two agents in
-// one process therefore race on the environment block.
+// Shape: the parent proves the fixture live and takes a baseline, then
+// re-executes this binary with `Command::env` (`GROK_HOME`, proxy URL, a child
+// marker) so the child gets its own process — and therefore its own managed
+// cache — without this process's environment ever being written. The child
+// creates exactly one restricted session; the parent then asserts both
+// `/proxy/mcp/configs` and `/mcp/e2` are unchanged.
 //
-// The fix is to stop mutating the environment per agent (pass the home
-// directory through the API and set process-wide values exactly once), not to
-// weaken the negative evidence to a single shared agent.
+// Why a child rather than a second in-process agent: a shared managed cache
+// would let "zero fetches" be a cache hit rather than a policy decision, and
+// the environment a second agent needs can only be set with
+// `std::env::set_var`, which is unsound once the first agent's reqwest and MCP
+// workers are running (that is what aborted with STATUS_HEAP_CORRUPTION).
 //
-// Positive half (T17-E2) is proven: the control plane is hit with the seeded
-// bearer and `/mcp/e2` completes a full three-step handshake.
+// Open problem: the spawned child did not finish within 10 minutes. Not yet
+// diagnosed. First suspect is `scratch_home()`, which unconditionally writes
+// `GROK_HOME` and would therefore override the value `Command::env` passed in;
+// the child branch needs to honour an inherited home instead.
+
 
