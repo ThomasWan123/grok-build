@@ -414,6 +414,30 @@ impl MvpAgent {
             .unwrap()
             .clone()
     }
+    /// Clear the subagent observation points.
+    ///
+    /// Called before a run whose expected answer is "nothing": leftovers from an
+    /// earlier positive run would otherwise satisfy the assertions on their own.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn reset_subagent_observations() {
+        crate::agent::subagent::handle_request::LAST_AGENT_MCP_SERVERS
+            .lock()
+            .unwrap()
+            .clear();
+        *crate::agent::subagent::handle_request::LAST_AGENT_DEF_MCP_COUNT
+            .lock()
+            .unwrap() = 0;
+        *crate::agent::subagent::handle_request::LAST_SUBAGENT_PLUGIN_COUNT
+            .lock()
+            .unwrap() = None;
+    }
+    /// Plugins the last subagent's spawn context carried (injection source I1).
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn last_subagent_plugin_count() -> Option<usize> {
+        *crate::agent::subagent::handle_request::LAST_SUBAGENT_PLUGIN_COUNT
+            .lock()
+            .unwrap()
+    }
     /// Entry count the last subagent's definition carried before materialization.
     #[cfg(feature = "local-extensions-test-support")]
     pub fn last_subagent_def_mcp_count() -> usize {

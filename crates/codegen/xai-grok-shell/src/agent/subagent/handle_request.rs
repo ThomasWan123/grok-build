@@ -29,6 +29,14 @@ pub static LAST_AGENT_MCP_SERVERS: std::sync::Mutex<Vec<String>> =
 /// How many entries the agent definition itself carried, before materialization.
 #[cfg(feature = "local-extensions-test-support")]
 pub static LAST_AGENT_DEF_MCP_COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+/// Plugins the spawn context handed the subagent (injection source I1).
+///
+/// `None` = no registry at all. Observed separately from the hook and MCP
+/// sources because I1 leaks through a different field: the *shared* registry,
+/// which the parent's own (zeroed) one says nothing about.
+#[cfg(feature = "local-extensions-test-support")]
+pub static LAST_SUBAGENT_PLUGIN_COUNT: std::sync::Mutex<Option<usize>> =
+    std::sync::Mutex::new(None);
 use xai_grok_tools::implementations::grok_build::task::types::*;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
@@ -1087,6 +1095,8 @@ pub(crate) async fn handle_subagent_request(
             .collect();
         *LAST_AGENT_MCP_SERVERS.lock().unwrap() = names;
         *LAST_AGENT_DEF_MCP_COUNT.lock().unwrap() = definition.mcp_servers.len();
+        *LAST_SUBAGENT_PLUGIN_COUNT.lock().unwrap() =
+            ctx.plugin_registry.as_ref().map(|r| r.list().len());
     }
     let mcp_owned_count = agent_mcp_servers.len() as u32;
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentLaunched {

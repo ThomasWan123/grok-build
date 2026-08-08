@@ -2391,6 +2391,15 @@ fn agent_with_subagent_fixture(
     script: &std::path::Path,
     mcp_url: &str,
 ) -> (MvpAgent, tempfile::TempDir) {
+    agent_with_subagent_fixture_and_plugins(model_url, script, mcp_url, &[])
+}
+
+fn agent_with_subagent_fixture_and_plugins(
+    model_url: &str,
+    script: &std::path::Path,
+    mcp_url: &str,
+    plugin_dirs: &[&std::path::Path],
+) -> (MvpAgent, tempfile::TempDir) {
     scratch_home();
     let temp = tempfile::tempdir().expect("temp dir");
     seed_fresh_xai_oidc_auth(temp.path());
@@ -2402,6 +2411,7 @@ fn agent_with_subagent_fixture(
     GATEWAY_RX.with(|slot| *slot.borrow_mut() = Some(rx));
     let gateway = xai_acp_lib::AcpAgentGatewaySender::new(tx);
     let mut cfg = xai_grok_shell::agent::config::Config::default();
+    cfg.plugins.cli_plugin_dirs = plugin_dirs.iter().map(|p| p.to_path_buf()).collect();
     cfg.cli_agents = vec![
         serde_json::from_value(subagent_definition(script, mcp_url))
             .expect("agent definition parses"),
@@ -2425,8 +2435,16 @@ local_test!(t19_positive_subagent_receives_definition_hook_and_mcp, async {
     let (script, log) = hook_sentinel(hook_dir.path());
     let (mcp_base, mcp_hits) = spawn_mcp_fixture().await;
     let (model_url, routing) = spawn_routing_model().await;
-    let (a, tmp) =
-        agent_with_subagent_fixture(&model_url, &script, &format!("{mcp_base}/sub"));
+    // A plugin is installed so the shared registry is genuinely populated: the
+    // assertion below that the subagent *does* receive one is what gives T20's
+    // `None` its meaning.
+    let plugin = plugin_fixture("t19-shared-plugin");
+    let (a, tmp) = agent_with_subagent_fixture_and_plugins(
+        &model_url,
+        &script,
+        &format!("{mcp_base}/sub"),
+        &[plugin.path()],
+    );
     init(&a).await;
     let sid = ordinary_session(&a, tmp.path()).await;
 
@@ -2450,6 +2468,10 @@ local_test!(t19_positive_subagent_receives_definition_hook_and_mcp, async {
         1,
         "the definition must carry exactly one MCP entry"
     );
+    assert!(
+        MvpAgent::last_subagent_plugin_count().is_some(),
+        "an ordinary parent's subagent does receive a plugin registry — without          this, T20's `None` could just mean the field is never populated"
+    );
     assert_eq!(
         MvpAgent::last_subagent_mcp_servers(),
         vec!["sub-src".to_string()],
@@ -2471,3 +2493,118 @@ local_test!(t19_positive_subagent_receives_definition_hook_and_mcp, async {
     );
 });
 
+
+// ---------------------------------------------------------------------------
+// T20 — a restricted parent's subagent gets none of the three sources back
+//
+// Runs inside a *single* `MvpAgent` sharing one plugin registry. Splitting it
+// across two agents would leave the most dangerous path untested: I1 is the
+// subagent coordinator reading the **shared** registry, which is unrelated to
+// the parent's own (zeroed) one, so a second process would simply not have the
+// thing that could leak.
+// ---------------------------------------------------------------------------
+
+local_test!(t20_restricted_parent_subagent_gets_nothing_back, async {
+    let plugin = plugin_fixture("t20-shared-plugin");
+    let hook_dir = tempfile::tempdir().expect("hook dir");
+    let (script, log) = hook_sentinel(hook_dir.path());
+    let (mcp_base, mcp_hits) = spawn_mcp_fixture().await;
+    let (model_url, routing) = spawn_routing_model().await;
+    let (a, tmp) = agent_with_subagent_fixture_and_plugins(
+        &model_url,
+        &script,
+        &format!("{mcp_base}/sub"),
+        &[plugin.path()],
+    );
+    init(&a).await;
+
+    // 1 — an ordinary parent loads the plugin, so the shared source exists.
+    let code_parent = ordinary_session(&a, tmp.path()).await;
+    assert_eq!(
+        a.session_raw_plugin_registry(&code_parent).await,
+        Some(Some(1)),
+        "the Code parent must actually have the plugin loaded"
+    );
+    assert!(
+        a.plugin_registry_snapshot().is_some_and(|r| !r.list().is_empty()),
+        "the agent-level shared registry must be non-empty, or I1 has nothing to leak"
+    );
+
+    // 2 — baselines.
+    let hook_lines_before = hook_lines(&log).len();
+    let mcp_before = mcp_hits.lock().unwrap().initialize.get("sub").copied().unwrap_or(0);
+    let routing_before = {
+        let r = routing.lock().unwrap();
+        (r.parent_initial, r.subagent, r.parent_after_tool)
+    };
+    // Cleared so a leftover positive result cannot satisfy the assertions.
+    MvpAgent::reset_subagent_observations();
+
+    // 3 — the restricted parent, in the same agent.
+    let restricted_cwd = tempfile::tempdir().expect("cwd");
+    let restricted = disabled_session(&a, restricted_cwd.path()).await;
+    assert_eq!(
+        a.session_raw_plugin_registry(&restricted).await,
+        Some(None),
+        "the restricted parent's own registry must be empty"
+    );
+
+    // 4 — derive, using the very same definition the positive control used.
+    a.prompt(acp::PromptRequest::new(
+        restricted.clone(),
+        vec![acp::ContentBlock::from("please delegate")],
+    ))
+    .await
+    .expect("restricted parent prompt");
+
+    // 5 — the delegation really happened. Without this every assertion below
+    // would hold for a run in which no subagent was ever spawned.
+    {
+        let r = routing.lock().unwrap();
+        assert!(
+            r.parent_initial > routing_before.0
+                && r.subagent > routing_before.1
+                && r.parent_after_tool > routing_before.2,
+            "all three turns must have run: before={routing_before:?} now={r:?}"
+        );
+    }
+
+    // 6 — and the subagent got none of the three sources.
+    assert_eq!(
+        MvpAgent::last_subagent_plugin_count(),
+        None,
+        "I1: the subagent must not be handed the shared plugin registry"
+    );
+    assert_eq!(
+        MvpAgent::last_subagent_mcp_servers(),
+        Vec::<String>::new(),
+        "I3: the definition's inline MCP must not materialize"
+    );
+    let mcp_grew = wait_for(|| {
+        mcp_hits.lock().unwrap().initialize.get("sub").copied().unwrap_or(0) > mcp_before
+    })
+    .await;
+    assert!(
+        !mcp_grew,
+        "and must not connect; initialize={:?}",
+        mcp_hits.lock().unwrap().initialize
+    );
+    let hook_fired = wait_for(|| hook_lines(&log).len() > hook_lines_before).await;
+    assert!(
+        !hook_fired,
+        "I2: the definition's inline hook must not fire; new lines={:?}",
+        &hook_lines(&log)[hook_lines_before..]
+    );
+    assert!(
+        hook_hits_for(&log, &restricted).is_empty(),
+        "nor under the restricted parent's own session id"
+    );
+
+    // 7 — the parent stayed empty, and the shared source is still there, so the
+    // zeroes above are the policy and not a vanished registry.
+    assert_eq!(a.session_raw_plugin_registry(&restricted).await, Some(None));
+    assert!(
+        a.plugin_registry_snapshot().is_some_and(|r| !r.list().is_empty()),
+        "the shared registry must still be non-empty at the end"
+    );
+});
