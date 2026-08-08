@@ -298,7 +298,7 @@ impl MvpAgent {
             .sessions
             .borrow()
             .get(&parent_sid)
-            .map_or(true, |h| h.local_extensions_disabled);
+            .is_none_or(|h| h.local_extensions_disabled);
         crate::agent::subagent::SubagentValidationContext {
             parent_cwd,
             // Injection source I1: this is the *shared* registry, unrelated to
@@ -439,7 +439,7 @@ impl MvpAgent {
             .sessions
             .borrow()
             .get(&parent_sid)
-            .map_or(true, |h| h.local_extensions_disabled);
+            .is_none_or(|h| h.local_extensions_disabled);
         let parent_max_turns = {
             let sessions = self.sessions.borrow();
             sessions.get(&parent_sid).and_then(|h| h.max_turns)
