@@ -113,6 +113,14 @@ pub(crate) fn reject_direct_hub_cloud_meta(
     }
     Ok(())
 }
+/// Servers the last session assembled from the three LSP sources (test-only).
+#[cfg(feature = "local-extensions-test-support")]
+pub static LAST_LSP_SERVER_NAMES: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+/// How many `LspManager`s have been constructed (test-only).
+#[cfg(feature = "local-extensions-test-support")]
+pub static LSP_MANAGER_CONSTRUCTIONS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
 /// Session `_meta` key carrying the built-in-tools-only policy.
 ///
 /// Top-level, alongside `x.ai/mcp/servers` and `agentProfile` — deliberately

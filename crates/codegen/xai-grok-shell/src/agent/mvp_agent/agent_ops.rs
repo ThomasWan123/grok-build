@@ -431,6 +431,21 @@ impl MvpAgent {
             .lock()
             .unwrap() = None;
     }
+    /// Servers the last session assembled from the three LSP sources.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn last_lsp_server_names() -> Vec<String> {
+        super::LAST_LSP_SERVER_NAMES.lock().unwrap().clone()
+    }
+    /// Number of `LspManager` constructions so far.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn lsp_manager_constructions() -> usize {
+        *super::LSP_MANAGER_CONSTRUCTIONS.lock().unwrap()
+    }
+    /// Clear the LSP observation points.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn reset_lsp_observations() {
+        super::LAST_LSP_SERVER_NAMES.lock().unwrap().clear();
+    }
     /// Plugins the last subagent's spawn context carried (injection source I1).
     #[cfg(feature = "local-extensions-test-support")]
     pub fn last_subagent_plugin_count() -> Option<usize> {
@@ -3463,6 +3478,15 @@ impl MvpAgent {
                 sourced,
             );
             tool_ctx.lsp_server_names = servers.keys().cloned().collect();
+            // Observation point: which servers this session assembled, and how
+            // many times an `LspManager` was constructed. Names rather than a
+            // count, so each of the three sources is attributable; the manager
+            // counter is separate because "no subprocess" is weak evidence when
+            // language servers start lazily.
+            #[cfg(feature = "local-extensions-test-support")]
+            {
+                *LAST_LSP_SERVER_NAMES.lock().unwrap() = tool_ctx.lsp_server_names.clone();
+            }
             if servers.is_empty() {
                 let user_path = xai_grok_tools::util::grok_home::grok_home()
                     .join("lsp.json");
@@ -3476,6 +3500,13 @@ impl MvpAgent {
                 use xai_grok_tools::implementations::lsp::{
                     LspBackend, LspBackendAdapter, LspManager,
                 };
+                // Counted here rather than inferred from subprocesses: language
+                // servers start lazily, so "no child process" would be weak
+                // evidence that no manager was ever built.
+                #[cfg(feature = "local-extensions-test-support")]
+                {
+                    *LSP_MANAGER_CONSTRUCTIONS.lock().unwrap() += 1;
+                }
                 let mgr = std::sync::Arc::new(
                     tokio::sync::Mutex::new(
                         LspManager::new(

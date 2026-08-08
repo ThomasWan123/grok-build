@@ -132,6 +132,12 @@ fn seed_fresh_xai_oidc_auth(dir: &std::path::Path) {
 ///
 /// Child processes get theirs via `Command::env` instead, which never touches
 /// this process at all.
+/// The process-wide scratch home, for tests that need to write into it.
+fn scratch_home_path() -> std::path::PathBuf {
+    scratch_home();
+    std::path::PathBuf::from(std::env::var_os("GROK_HOME").expect("scratch home is set"))
+}
+
 fn scratch_home() {
     static HOME: std::sync::OnceLock<Option<tempfile::TempDir>> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
@@ -1717,6 +1723,9 @@ fn agent_with_model_and_plugins(
     let gateway = xai_acp_lib::AcpAgentGatewaySender::new(tx);
     let mut cfg = xai_grok_shell::agent::config::Config::default();
     cfg.plugins.cli_plugin_dirs = plugin_dirs.iter().map(|p| p.to_path_buf()).collect();
+    // LSP is off by default; T13 needs it on for the Code control to have
+    // anything to assemble.
+    cfg.features.lsp_tools = Some(true);
     let agent = MvpAgent::new(gateway, &cfg, auth, Some(mock_catalog(model_url)))
         .expect("valid test config");
     (agent, temp)
@@ -2607,4 +2616,113 @@ local_test!(t20_restricted_parent_subagent_gets_nothing_back, async {
         a.plugin_registry_snapshot().is_some_and(|r| !r.list().is_empty()),
         "the shared registry must still be non-empty at the end"
     );
+});
+
+// ---------------------------------------------------------------------------
+// T13 — the three LSP sources
+//
+// Each source gets its own server id, so the Code control can assert the exact
+// set and each per-source mutation shows up as a single missing/extra id.
+// ---------------------------------------------------------------------------
+
+const LSP_PLUGIN_ID: &str = "led-lsp-plugin";
+const LSP_USER_ID: &str = "led-lsp-user";
+const LSP_PROJECT_ID: &str = "led-lsp-project";
+
+fn lsp_entry(id: &str) -> serde_json::Value {
+    // `extensions` is a map, not a list — a list makes the whole entry fail to
+    // deserialize and the server simply never appears, with no error surfaced.
+    serde_json::json!({
+        id: {
+            "command": "cmd",
+            "args": ["/c", "echo"],
+            "extensions": { ".led": "led" }
+        }
+    })
+}
+
+/// A plugin contributing its own LSP server, plus the user- and project-level
+/// `lsp.json` files. Returns the project cwd.
+fn lsp_sources(home: &std::path::Path) -> (tempfile::TempDir, tempfile::TempDir) {
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    // A plugin contributes LSP through its manifest's `lspServers` field —
+    // inline here, so the fixture does not depend on the default file name.
+    // Dropping an `lsp.json` in the plugin directory does nothing: the loader
+    // reads the manifest, not the directory.
+    std::fs::write(
+        plugin.path().join("plugin.json"),
+        serde_json::json!({
+            "name": "led-lsp-contributor",
+            "lspServers": lsp_entry(LSP_PLUGIN_ID),
+        })
+        .to_string(),
+    )
+    .expect("plugin.json");
+
+    std::fs::write(home.join("lsp.json"), lsp_entry(LSP_USER_ID).to_string())
+        .expect("user lsp.json");
+
+    let project = tempfile::tempdir().expect("project dir");
+    std::fs::create_dir_all(project.path().join(".grok")).expect(".grok");
+    std::fs::write(
+        project.path().join(".grok").join("lsp.json"),
+        lsp_entry(LSP_PROJECT_ID).to_string(),
+    )
+    .expect("project lsp.json");
+    (plugin, project)
+}
+
+local_test!(t13_lsp_three_sources_for_code_none_for_restricted, async {
+    let home = scratch_home_path();
+    let (plugin, project) = lsp_sources(&home);
+    let (model_url, _routing) = spawn_mock_model().await;
+    let (a, _tmp) = agent_with_model_and_plugins(&model_url, &[plugin.path()]);
+    init(&a).await;
+
+    // --- T13a/b/c/d: the Code control assembles exactly the three ---------
+    MvpAgent::reset_lsp_observations();
+    let code = ordinary_session(&a, project.path()).await;
+    let mut assembled = MvpAgent::last_lsp_server_names();
+    assembled.sort();
+    let expected = {
+        let mut v = vec![
+            LSP_PLUGIN_ID.to_string(),
+            LSP_PROJECT_ID.to_string(),
+            LSP_USER_ID.to_string(),
+        ];
+        v.sort();
+        v
+    };
+    assert_eq!(
+        assembled, expected,
+        "the Code session must assemble all three LSP sources"
+    );
+    let _ = code;
+
+    // --- Restricted: nothing assembled, no manager built ------------------
+    MvpAgent::reset_lsp_observations();
+    let managers_before = MvpAgent::lsp_manager_constructions();
+    let restricted = disabled_session(&a, project.path()).await;
+    assert_eq!(
+        MvpAgent::last_lsp_server_names(),
+        Vec::<String>::new(),
+        "a restricted session must assemble no LSP server from any source"
+    );
+    assert_eq!(
+        MvpAgent::lsp_manager_constructions(),
+        managers_before,
+        "and must not construct an LspManager — counted directly, because          language servers start lazily and 'no subprocess' proves little"
+    );
+    let _ = restricted;
+
+    // --- The sources are still there, so the zeroes are the policy --------
+    MvpAgent::reset_lsp_observations();
+    let code_again = ordinary_session(&a, project.path()).await;
+    let mut assembled_again = MvpAgent::last_lsp_server_names();
+    assembled_again.sort();
+    assert_eq!(
+        assembled_again, expected,
+        "the three sources must still be present at the end; otherwise the          restricted session's empty set could be a vanished fixture"
+    );
+    let _ = code_again;
 });
