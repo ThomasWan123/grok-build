@@ -135,12 +135,19 @@ fn seed_fresh_xai_oidc_auth(dir: &std::path::Path) {
 fn scratch_home() {
     static HOME: std::sync::OnceLock<Option<tempfile::TempDir>> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
-        // A child spawned by `t16_e2_restricted_child_neither_lists_nor_connects`
-        // is handed its home through `Command::env`. Overwriting it here would
-        // silently discard the isolation the parent set up, so an inherited
-        // value is left exactly as it is — and the child then performs no
-        // environment write at all.
-        if std::env::var_os("GROK_HOME").is_some() {
+        // Inherit only in the child branch, which is handed an isolated home
+        // through `Command::env`; overwriting that would discard the isolation
+        // the parent set up, and the child then writes no environment at all.
+        //
+        // A parent run always overrides, even when `GROK_HOME` is already set:
+        // honouring an ambient value would put session files in whatever
+        // directory the developer happens to have configured — including their
+        // real `~/.grok`.
+        if std::env::var_os(CHILD_PROXY).is_some() {
+            debug_assert!(
+                std::env::var_os("GROK_HOME").is_some(),
+                "the child branch must be given an isolated home"
+            );
             return None;
         }
         let dir = tempfile::tempdir().expect("scratch home");
@@ -1496,45 +1503,42 @@ local_test!(t17_e2_managed_mcp_control_and_data_plane, async {
 // revision did exactly that and hung past ten minutes.
 // ---------------------------------------------------------------------------
 
+/// Present only in the child: carries the fixture's proxy URL and selects the
+/// child branch of the single test below.
 const CHILD_PROXY: &str = "LED_T16_E2_PROXY";
 
-/// The child: one restricted session on a managed-MCP-enabled agent, then exit.
-///
-/// Registered as a test so the harness can select it by name. The marker check
-/// is the first statement so a parent run exits immediately and cannot recurse
-/// into spawning further children.
-#[tokio::test(flavor = "current_thread")]
-async fn t16_e2_child_worker() {
-    let Ok(proxy) = std::env::var(CHILD_PROXY) else {
-        return; // parent run: inert
-    };
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let (a, tmp) = agent_full(&[], Some(&proxy));
-            init(&a).await;
-            let sid = disabled_session(&a, tmp.path()).await;
-            assert_eq!(
-                a.session_local_extensions_disabled_snapshot(&sid),
-                Some(true),
-                "the child must actually have created a restricted session"
-            );
-            // Hold open for the same budget the parent's positive half needed,
-            // so the parent is not measuring a window that never opened.
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        })
-        .await;
-}
-
 local_test!(t16_e2_restricted_child_neither_lists_nor_connects, async {
+    // One test entry, two branches. A separate `#[tokio::test]` child worker
+    // would be reported as a passing test in every ordinary run while doing
+    // nothing at all — a green result that asserts nothing is exactly the kind
+    // of thing this file exists to prevent.
+    if let Ok(proxy) = std::env::var(CHILD_PROXY) {
+        let (a, tmp) = agent_full(&[], Some(&proxy));
+        init(&a).await;
+        let sid = disabled_session(&a, tmp.path()).await;
+        assert_eq!(
+            a.session_local_extensions_disabled_snapshot(&sid),
+            Some(true),
+            "the child must actually have created a restricted session"
+        );
+        // Hold open for the same budget the parent's positive half needed, so
+        // the parent is not measuring a window that never opened.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        return;
+    }
+
     let (base, hits) = spawn_mcp_fixture().await;
     let proxy = proxy_base(&base);
 
     // Prove the fixture and credential live here first: a quiet child proves
     // nothing if managed MCP was broken to begin with.
     //
-    // Held for the rest of the test rather than scoped to a block. Dropping an
-    // agent while its MCP and reqwest workers are still running corrupts the
-    // heap, so agents in this file live as long as the test does.
+    // Held for the rest of the test rather than scoped to a block. Scoping it
+    // coincided with a process abort here, but that is one observation and no
+    // mechanism has been established — a normal drop in safe Rust should not
+    // corrupt the heap, and the one root cause actually confirmed in this file
+    // was concurrent environment mutation. Kept alive because nothing needs it
+    // dropped early, not as a rule about agent lifetimes.
     let (prover, prover_tmp) = agent_full(&[], Some(&proxy));
     init(&prover).await;
     ordinary_session(&prover, prover_tmp.path()).await;
@@ -1548,11 +1552,16 @@ local_test!(t16_e2_restricted_child_neither_lists_nor_connects, async {
         "the managed fixture must be proven live before measuring the child"
     );
 
-    let baseline = {
+    // All three counters are captured separately: comparing `tools_list`
+    // against the `initialize` baseline would silently mask a divergence
+    // between them (a retried or partial connection moves one without the
+    // other).
+    let (base_configs, base_init, base_tools) = {
         let h = hits.lock().unwrap();
         (
             h.managed_configs,
             h.initialize.get("e2").copied().unwrap_or(0),
+            h.tools_list.get("e2").copied().unwrap_or(0),
         )
     };
 
@@ -1564,7 +1573,7 @@ local_test!(t16_e2_restricted_child_neither_lists_nor_connects, async {
         std::time::Duration::from_secs(120),
         tokio::process::Command::new(exe)
             .args([
-                "t16_e2_child_worker",
+                "t16_e2_restricted_child_neither_lists_nor_connects",
                 "--exact",
                 "--test-threads=1",
                 "--nocapture",
@@ -1586,27 +1595,26 @@ local_test!(t16_e2_restricted_child_neither_lists_nor_connects, async {
     // restricted session connected to no managed server.
     assert_eq!(
         h.initialize.get("e2").copied().unwrap_or(0),
-        baseline.1,
+        base_init,
         "a restricted session must not connect to a managed MCP server;          initialize={:?}",
         h.initialize
     );
     assert_eq!(
         h.tools_list.get("e2").copied().unwrap_or(0),
-        baseline.1,
+        base_tools,
         "and must not list its tools either; tools_list={:?}",
         h.tools_list
     );
-    // Control plane moves by exactly one, and that one is *not* attributable to
-    // the session: an agent with managed MCP enabled lists connectors while
-    // coming up, before any session exists. Measured, not assumed — a child
-    // that creates no session at all produces the same single hit. Asserting
-    // `+1` rather than `unchanged` keeps the check sharp: a session-triggered
-    // fetch would show up as a second one.
-    assert_eq!(
-        h.managed_configs,
-        baseline.0 + 1,
-        "exactly one agent-level listing, none attributable to the restricted          session; baseline={} now={}",
-        baseline.0,
+    // The control plane must *move*, but the exact count is not a policy
+    // contract — it depends on whether the fetch was retried, which this test
+    // has no business pinning. What it does prove is that the child's
+    // credential worked and it really did obtain the managed configuration:
+    // without that, the zero data-plane deltas above could just mean the child
+    // never got as far as having something to connect to.
+    assert!(
+        h.managed_configs > base_configs,
+        "the child must have listed managed connectors (proving its auth          worked), else the zero connection deltas prove nothing; baseline={}          now={}",
+        base_configs,
         h.managed_configs
     );
     drop(h);
