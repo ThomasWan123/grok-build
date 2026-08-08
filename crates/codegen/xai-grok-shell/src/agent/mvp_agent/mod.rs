@@ -137,6 +137,28 @@ pub static ASSEMBLY_FAILPOINT_HITS: std::sync::Mutex<usize> = std::sync::Mutex::
 #[cfg(feature = "local-extensions-test-support")]
 pub static LATCH_DROP_FAILPOINT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
+// Feature-gated defence bypasses used only by the redundancy matrix. Each bit
+// disables one independently useful line of defence; production builds contain
+// neither the mask nor the setters that can change it.
+#[cfg(feature = "local-extensions-test-support")]
+pub(crate) const BYPASS_HOOK_INPUT: u8 = 1 << 0;
+#[cfg(feature = "local-extensions-test-support")]
+pub(crate) const BYPASS_HOOK_SPAWN: u8 = 1 << 1;
+#[cfg(feature = "local-extensions-test-support")]
+pub(crate) const BYPASS_HOOK_DISPATCH: u8 = 1 << 2;
+#[cfg(feature = "local-extensions-test-support")]
+pub(crate) const BYPASS_PLUGIN_BROADCAST: u8 = 1 << 3;
+#[cfg(feature = "local-extensions-test-support")]
+pub(crate) const BYPASS_PLUGIN_APPLY: u8 = 1 << 4;
+#[cfg(feature = "local-extensions-test-support")]
+pub(crate) static DEFENCE_BYPASS_MASK: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "local-extensions-test-support")]
+pub(crate) fn defence_bypassed(bit: u8) -> bool {
+    DEFENCE_BYPASS_MASK.load(std::sync::atomic::Ordering::SeqCst) & bit != 0
+}
+
 /// Servers the last session assembled from the three LSP sources (test-only).
 #[cfg(feature = "local-extensions-test-support")]
 pub static LAST_LSP_SERVER_NAMES: std::sync::Mutex<Vec<String>> =
@@ -2339,7 +2361,11 @@ impl MvpAgent {
                 // reject the snapshot on arrival — `apply_plugin_registry_snapshot`
                 // still early-returns as a second line, but not sending is
                 // what makes the guarantee independent of that.
-                if h.local_extensions_disabled {
+                #[cfg(feature = "local-extensions-test-support")]
+                let broadcast_bypassed = defence_bypassed(BYPASS_PLUGIN_BROADCAST);
+                #[cfg(not(feature = "local-extensions-test-support"))]
+                let broadcast_bypassed = false;
+                if h.local_extensions_disabled && !broadcast_bypassed {
                     tracing::debug!(
                         session_id = %sid.0,
                         "local_extensions_disabled: skipped in plugin registry broadcast"

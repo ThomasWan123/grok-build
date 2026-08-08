@@ -224,11 +224,27 @@ impl SessionActor {
         // guard is here so that a future source which populates either of
         // those without going through the spawn path still cannot fire hooks
         // in such a session. If it ever triggers, something upstream leaked.
-        if self.rebuild_spec.local_extensions_disabled {
-            debug_assert!(
-                !self.hook_event_active(event),
-                "local_extensions_disabled session has live hooks: {event:?}"
-            );
+        #[cfg(feature = "local-extensions-test-support")]
+        let dispatch_bypassed = crate::agent::mvp_agent::defence_bypassed(
+            crate::agent::mvp_agent::BYPASS_HOOK_DISPATCH,
+        );
+        #[cfg(feature = "local-extensions-test-support")]
+        let upstream_bypassed = crate::agent::mvp_agent::defence_bypassed(
+            crate::agent::mvp_agent::BYPASS_HOOK_INPUT,
+        ) || crate::agent::mvp_agent::defence_bypassed(
+            crate::agent::mvp_agent::BYPASS_HOOK_SPAWN,
+        );
+        #[cfg(not(feature = "local-extensions-test-support"))]
+        let dispatch_bypassed = false;
+        #[cfg(not(feature = "local-extensions-test-support"))]
+        let upstream_bypassed = false;
+        if self.rebuild_spec.local_extensions_disabled && !dispatch_bypassed {
+            if !upstream_bypassed {
+                debug_assert!(
+                    !self.hook_event_active(event),
+                    "local_extensions_disabled session has live hooks: {event:?}"
+                );
+            }
             return;
         }
         if !self.hook_event_active(event) {

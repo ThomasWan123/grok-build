@@ -455,6 +455,37 @@ impl MvpAgent {
     pub fn assembly_failpoint_hits() -> usize {
         *super::ASSEMBLY_FAILPOINT_HITS.lock().unwrap()
     }
+    /// Selectively bypass the three redundant hook defences (test-only).
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn set_hook_defence_bypasses(input: bool, spawn: bool, dispatch: bool) {
+        let mut mask = super::DEFENCE_BYPASS_MASK.load(std::sync::atomic::Ordering::SeqCst);
+        mask &= !(super::BYPASS_HOOK_INPUT
+            | super::BYPASS_HOOK_SPAWN
+            | super::BYPASS_HOOK_DISPATCH);
+        if input {
+            mask |= super::BYPASS_HOOK_INPUT;
+        }
+        if spawn {
+            mask |= super::BYPASS_HOOK_SPAWN;
+        }
+        if dispatch {
+            mask |= super::BYPASS_HOOK_DISPATCH;
+        }
+        super::DEFENCE_BYPASS_MASK.store(mask, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Selectively bypass the two plugin fan-out defences (test-only).
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn set_plugin_fanout_defence_bypasses(broadcast: bool, apply: bool) {
+        let mut mask = super::DEFENCE_BYPASS_MASK.load(std::sync::atomic::Ordering::SeqCst);
+        mask &= !(super::BYPASS_PLUGIN_BROADCAST | super::BYPASS_PLUGIN_APPLY);
+        if broadcast {
+            mask |= super::BYPASS_PLUGIN_BROADCAST;
+        }
+        if apply {
+            mask |= super::BYPASS_PLUGIN_APPLY;
+        }
+        super::DEFENCE_BYPASS_MASK.store(mask, std::sync::atomic::Ordering::SeqCst);
+    }
     /// Servers the last session assembled from the three LSP sources.
     #[cfg(feature = "local-extensions-test-support")]
     pub fn last_lsp_server_names() -> Vec<String> {
@@ -3685,11 +3716,16 @@ impl MvpAgent {
             // called from inside this closure. The agent definition itself is
             // left untouched — it is shared with other sessions, and this
             // session simply declines to install its hooks.
+            #[cfg(feature = "local-extensions-test-support")]
+            let hook_input_bypassed =
+                super::defence_bypassed(super::BYPASS_HOOK_INPUT);
+            #[cfg(not(feature = "local-extensions-test-support"))]
+            let hook_input_bypassed = false;
             let agent_hook_registry_override = agent_definition
                 .hooks
                 .as_ref()
                 .filter(|_| {
-                    if local_extensions_disabled {
+                    if local_extensions_disabled && !hook_input_bypassed {
                         tracing::info!(
                             session_id = %session_info.id.0,
                             agent = %agent_definition.name,
@@ -3697,7 +3733,7 @@ impl MvpAgent {
                              and skipping disk hook discovery"
                         );
                     }
-                    !local_extensions_disabled
+                    !local_extensions_disabled || hook_input_bypassed
                 })
                 .and_then(|hooks_config| {
                     let hooks_val = hooks_config.as_value();

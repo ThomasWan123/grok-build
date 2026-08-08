@@ -2925,3 +2925,136 @@ local_test!(t7_failed_assembly_is_never_confirmed, async {
         "the loaded handle must expose the dropped latch"
     );
 });
+
+// ---------------------------------------------------------------------------
+// Defence redundancy matrices
+// ---------------------------------------------------------------------------
+
+struct DefenceBypassReset;
+
+impl Drop for DefenceBypassReset {
+    fn drop(&mut self) {
+        MvpAgent::set_hook_defence_bypasses(false, false, false);
+        MvpAgent::set_plugin_fanout_defence_bypasses(false, false);
+    }
+}
+
+async fn run_hook_defence_case(
+    a: &MvpAgent,
+    profile: &serde_json::Value,
+    log: &std::path::Path,
+    model_hits: &ModelProbe,
+    label: &str,
+    bypasses: (bool, bool, bool),
+    expect_hook: bool,
+) {
+    MvpAgent::set_hook_defence_bypasses(bypasses.0, bypasses.1, bypasses.2);
+    let cwd = tempfile::tempdir().expect("matrix cwd");
+    let sid = new_session(
+        a,
+        cwd.path(),
+        meta(serde_json::json!({ KEY: true, "agentProfile": profile })),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{label}: create restricted session: {e:?}"))
+    .session_id;
+
+    let model_before = model_hits.load(std::sync::atomic::Ordering::SeqCst);
+    a.prompt(acp::PromptRequest::new(
+        sid.clone(),
+        vec![acp::ContentBlock::from(format!("matrix-{label}"))],
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("{label}: prompt: {e:?}"));
+    assert!(
+        model_hits.load(std::sync::atomic::Ordering::SeqCst) > model_before,
+        "{label}: the turn must run before hook attribution is meaningful"
+    );
+
+    let fired = wait_for(|| !hook_hits_for(log, &sid).is_empty()).await;
+    assert_eq!(
+        fired, expect_hook,
+        "{label}: bypasses={bypasses:?}, hits={:?}",
+        hook_hits_for(log, &sid)
+    );
+}
+
+local_test!(hook_three_layer_redundancy_matrix, async {
+    let _reset = DefenceBypassReset;
+    MvpAgent::set_hook_defence_bypasses(false, false, false);
+    let hook_dir = tempfile::tempdir().expect("hook dir");
+    let (script, log) = hook_sentinel(hook_dir.path());
+    let profile = inline_hook_profile(&script);
+    let (model_url, model_hits) = spawn_mock_model().await;
+    let (a, _tmp) = agent_with_model(&model_url);
+    init(&a).await;
+
+    // `true` means that defence is bypassed. With all defences active, or
+    // with either one or two bypassed, the hook must remain blocked. Only
+    // bypassing all three is expected to expose the sentinel.
+    let cases = [
+        ("all_enabled", (false, false, false), false),
+        ("input_disabled", (true, false, false), false),
+        ("spawn_disabled", (false, true, false), false),
+        ("dispatch_disabled", (false, false, true), false),
+        ("input_only", (false, true, true), false),
+        ("spawn_only", (true, false, true), false),
+        ("dispatch_only", (true, true, false), false),
+        ("all_disabled", (true, true, true), true),
+    ];
+    for (label, bypasses, expect_hook) in cases {
+        run_hook_defence_case(
+            &a,
+            &profile,
+            &log,
+            &model_hits,
+            label,
+            bypasses,
+            expect_hook,
+        )
+        .await;
+    }
+});
+
+local_test!(plugin_fanout_two_layer_redundancy_matrix, async {
+    let _reset = DefenceBypassReset;
+    MvpAgent::set_plugin_fanout_defence_bypasses(false, false);
+    let fixture = plugin_fixture("fanout-matrix-plugin");
+    let (a, _tmp) = agent_with_plugins(&[fixture.path()]);
+    init(&a).await;
+
+    // For two defences, the single-disabled and single-enabled cases are the
+    // same two configurations. Each surviving layer must independently keep
+    // the restricted actor empty; only bypassing both may install the fixture.
+    let cases = [
+        ("all_enabled", (false, false), Some(None)),
+        ("broadcast_disabled_apply_only", (true, false), Some(None)),
+        ("apply_disabled_broadcast_only", (false, true), Some(None)),
+        ("all_disabled", (true, true), Some(Some(1))),
+    ];
+    for (label, bypasses, expected) in cases {
+        MvpAgent::set_plugin_fanout_defence_bypasses(bypasses.0, bypasses.1);
+        let restricted_cwd = tempfile::tempdir().expect("restricted cwd");
+        let ordinary_cwd = tempfile::tempdir().expect("ordinary cwd");
+        let restricted = disabled_session(&a, restricted_cwd.path()).await;
+        let ordinary = ordinary_session(&a, ordinary_cwd.path()).await;
+
+        ext(
+            &a,
+            "x.ai/plugins/action",
+            serde_json::json!({ "sessionId": ordinary.0, "action": { "type": "reload" } }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{label}: ordinary reload: {e:?}"));
+        assert_eq!(
+            a.session_raw_plugin_registry(&ordinary).await,
+            Some(Some(1)),
+            "{label}: the broadcast must carry a real plugin"
+        );
+        assert_eq!(
+            a.session_raw_plugin_registry(&restricted).await,
+            expected,
+            "{label}: bypasses={bypasses:?}"
+        );
+    }
+});

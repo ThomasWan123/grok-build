@@ -1068,8 +1068,14 @@ pub(crate) async fn spawn_session_actor(
         .to_owned();
     let allowed_subagent_types_for_handle = agent.definition().allowed_subagent_types.clone();
     let mut hook_discovery_errors: Vec<xai_grok_hooks::error::HookError> = Vec::new();
+    #[cfg(feature = "local-extensions-test-support")]
+    let hook_spawn_bypassed = crate::agent::mvp_agent::defence_bypassed(
+        crate::agent::mvp_agent::BYPASS_HOOK_SPAWN,
+    );
+    #[cfg(not(feature = "local-extensions-test-support"))]
+    let hook_spawn_bypassed = false;
     let built_hook_registry: Option<Arc<xai_grok_hooks::discovery::HookRegistry>> =
-        if local_extensions_disabled {
+        if local_extensions_disabled && !hook_spawn_bypassed {
             // Final gate for hook source D1. `agent_ops` already skips disk
             // discovery on the input side; this arm is the second half of the
             // same defence and is what makes the *fallback* below unreachable

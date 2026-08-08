@@ -849,7 +849,13 @@ impl SessionActor {
         // supplied registry is written into `self.plugin_registry`: any future
         // caller that reaches here — a direct `SessionCommand`, a fork, a
         // replay — must not be able to install one.
-        if self.rebuild_spec.local_extensions_disabled {
+        #[cfg(feature = "local-extensions-test-support")]
+        let apply_bypassed = crate::agent::mvp_agent::defence_bypassed(
+            crate::agent::mvp_agent::BYPASS_PLUGIN_APPLY,
+        );
+        #[cfg(not(feature = "local-extensions-test-support"))]
+        let apply_bypassed = false;
+        if self.rebuild_spec.local_extensions_disabled && !apply_bypassed {
             tracing::debug!(
                 session_id = sid,
                 "local_extensions_disabled: ignoring plugin registry snapshot"
