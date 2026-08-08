@@ -20,6 +20,18 @@ use agent_client_protocol as acp;
 use agent_client_protocol::Agent as _;
 use xai_grok_shell::agent::MvpAgent;
 
+thread_local! {
+    /// Receiver half of the gateway the most recently built agent writes to.
+    ///
+    /// Handed over rather than dropped so a test can answer reverse requests:
+    /// E4's MCP servers live in the *client*, so their only evidence is traffic
+    /// on this channel. A dropped receiver makes every reverse call fail, which
+    /// is indistinguishable from "the server was never registered".
+    static GATEWAY_RX: std::cell::RefCell<
+        Option<tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
 const KEY: &str = "x.ai/localExtensionsDisabled";
 const APPLIED: &str = "localExtensionsDisabledApplied";
 
@@ -66,7 +78,8 @@ fn agent_with_plugins(plugin_dirs: &[&std::path::Path]) -> (MvpAgent, tempfile::
         temp.path(),
         xai_grok_shell::auth::GrokComConfig::default(),
     ));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    GATEWAY_RX.with(|slot| *slot.borrow_mut() = Some(rx));
     let gateway = xai_acp_lib::AcpAgentGatewaySender::new(tx);
     let mut cfg = xai_grok_shell::agent::config::Config::default();
     cfg.plugins.cli_plugin_dirs = plugin_dirs.iter().map(|p| p.to_path_buf()).collect();
@@ -971,4 +984,177 @@ local_test!(t16_restricted_session_connects_to_nothing, async {
         h.initialize
     );
     assert_eq!((h.initialize.len(), h.tools_list.len()), baseline);
+});
+
+// ---------------------------------------------------------------------------
+// E4 — in-process SDK MCP servers over the ACP reverse channel
+//
+// Unlike E1/E2/E3 there is no transport to connect to: the server lives in the
+// client, and the agent reaches it by sending `x.ai/mcp/sdk_call` back over the
+// gateway. So the evidence is reverse traffic, and the fixture must *answer* —
+// an unanswered call fails on a timeout, which looks exactly like "the server
+// was never registered" and would let a broken interception read as success.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct SdkHits {
+    /// `(serverId, jsonrpc method)` → count. Keyed by content, never by call
+    /// order, so an extra or reordered handshake step cannot shift the tally.
+    calls: HashMap<(String, String), usize>,
+}
+
+/// Answer reverse requests until the agent drops the gateway.
+fn spawn_sdk_pump() -> Arc<Mutex<SdkHits>> {
+    use xai_acp_lib::AcpClientMessage;
+    let hits: Arc<Mutex<SdkHits>> = Arc::new(Mutex::new(SdkHits::default()));
+    let mut rx = GATEWAY_RX
+        .with(|slot| slot.borrow_mut().take())
+        .expect("gateway receiver was taken twice");
+    let sink = hits.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(msg) = rx.recv().await {
+            let AcpClientMessage::ExtMethod(args) = msg else {
+                // Notifications and other reverse requests are irrelevant here;
+                // dropping their sender is what a disconnected client does.
+                continue;
+            };
+            if args.request.method.as_ref() != "x.ai/mcp/sdk_call" {
+                continue;
+            }
+            let params: serde_json::Value =
+                serde_json::from_str(args.request.params.get()).unwrap_or_default();
+            let server_id = params["serverId"].as_str().unwrap_or_default().to_string();
+            let message = params["message"].clone();
+            let method = message["method"].as_str().unwrap_or_default().to_string();
+            *sink
+                .lock()
+                .unwrap()
+                .calls
+                .entry((server_id.clone(), method.clone()))
+                .or_insert(0) += 1;
+
+            let result = match method.as_str() {
+                "initialize" => serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": server_id, "version": "0.0.1" }
+                }),
+                "tools/list" => serde_json::json!({
+                    "tools": [{
+                        "name": format!("sdk_echo_{server_id}"),
+                        "description": "echo",
+                        "inputSchema": { "type": "object", "properties": {} }
+                    }]
+                }),
+                _ => serde_json::json!({}),
+            };
+            // Notifications carry no id and must not get a JSON-RPC response
+            // object, but the reverse *call* still needs an answer.
+            let payload = if message["id"].is_null() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": message["id"].clone(), "result": result
+                })
+            };
+            let raw = serde_json::value::RawValue::from_string(payload.to_string())
+                .expect("raw response");
+            let _ = args
+                .response_tx
+                .send(Ok(acp::ExtResponse::new(raw.into())));
+        }
+    });
+    hits
+}
+
+fn sdk_meta(server_id: &str, extra: serde_json::Value) -> Option<acp::Meta> {
+    let mut m = serde_json::json!({
+        "x.ai/mcp/servers": [ { "name": server_id, "serverId": server_id } ],
+    });
+    if let (Some(dst), Some(src)) = (m.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    m.as_object().cloned()
+}
+
+/// A completed E4 handshake is `initialize` + `tools/list` — deliberately
+/// *without* `notifications/initialized`.
+///
+/// The reverse bridge discards id-less messages locally rather than sending
+/// them, because the SDK peer rejects `x.ai/mcp/sdk_call`s with no JSON-RPC id
+/// (`xai-grok-mcp/src/acp_transport.rs`, "half-duplex v1"). Requiring the
+/// notification here would fail against a correct implementation; anyone who
+/// later adds it to this list should change the bridge first.
+fn sdk_handshake_complete(hits: &Arc<Mutex<SdkHits>>, server_id: &str) -> bool {
+    let h = hits.lock().unwrap();
+    ["initialize", "tools/list"]
+        .iter()
+        .all(|m| {
+            h.calls
+                .get(&(server_id.to_string(), (*m).to_string()))
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        })
+}
+
+local_test!(t17_e4_ordinary_session_completes_reverse_handshake, async {
+    let (http_base, http_hits) = spawn_mcp_fixture().await;
+    let (a, tmp) = agent();
+    let sdk_hits = spawn_sdk_pump();
+    init(&a).await;
+
+    let mut req = acp::NewSessionRequest::new(tmp.path().to_path_buf());
+    // E3 alongside E4, on separate books: a shared tally could let one source's
+    // traffic stand in for the other's.
+    req.mcp_servers = vec![http_server("e3-src", format!("{http_base}/e3"))];
+    req.meta = sdk_meta("e4-src", serde_json::json!({}));
+    a.new_session(req).await.expect("new session");
+
+    let done = wait_for(|| sdk_handshake_complete(&sdk_hits, "e4-src")).await;
+    let calls = sdk_hits.lock().unwrap().calls.clone();
+    assert!(
+        done,
+        "E4 must complete initialize + notifications/initialized + tools/list          over the reverse channel; calls={calls:?}"
+    );
+
+    // Books stay separate in both directions.
+    assert!(
+        calls.keys().all(|(sid, _)| sid == "e4-src"),
+        "no other server id may appear in the reverse tally; calls={calls:?}"
+    );
+    let http = http_hits.lock().unwrap();
+    assert_eq!(
+        http.initialize.get("e4").copied().unwrap_or(0),
+        0,
+        "E4 must not appear on the HTTP books"
+    );
+    assert!(
+        http.initialize.get("e3").copied().unwrap_or(0) >= 1,
+        "and E3 must still be on its own"
+    );
+});
+
+local_test!(t16_e4_restricted_session_makes_no_reverse_calls, async {
+    let (a, tmp) = agent();
+    let sdk_hits = spawn_sdk_pump();
+    init(&a).await;
+
+    let baseline = sdk_hits.lock().unwrap().calls.len();
+    let mut req = acp::NewSessionRequest::new(tmp.path().to_path_buf());
+    req.meta = sdk_meta("e4-src", serde_json::json!({ KEY: true }));
+    let resp = a.new_session(req).await.expect("new session");
+    assert_eq!(applied(&resp.meta), Some(&serde_json::Value::Bool(true)));
+
+    // Same budget the positive test needed, so an empty tally means "never
+    // called" rather than "not yet".
+    let called = wait_for(|| !sdk_hits.lock().unwrap().calls.is_empty()).await;
+    let calls = sdk_hits.lock().unwrap().calls.clone();
+    assert!(
+        !called,
+        "a restricted session must make no reverse MCP calls; calls={calls:?}"
+    );
+    assert_eq!(calls.len(), baseline);
 });
