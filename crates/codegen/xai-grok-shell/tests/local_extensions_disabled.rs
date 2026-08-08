@@ -800,3 +800,175 @@ local_test!(t24_plugins_list_waits_for_an_in_flight_load, async {
         "the waiting request must be answered from the loaded session's own          registry, not with the empty fail-closed answer"
     );
 });
+
+// ---------------------------------------------------------------------------
+// MCP fixture probe
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct Hits {
+    initialize: HashMap<String, usize>,
+    tools_list: HashMap<String, usize>,
+}
+
+async fn spawn_mcp_fixture() -> (String, Arc<Mutex<Hits>>) {
+    use axum::extract::{Path, State};
+    use axum::routing::post;
+    use axum::Router;
+
+    let hits: Arc<Mutex<Hits>> = Arc::new(Mutex::new(Hits::default()));
+    let app = Router::new()
+        .route(
+            "/mcp/{tag}",
+            post(
+                |State(hits): State<Arc<Mutex<Hits>>>,
+                 Path(tag): Path<String>,
+                 body: String| async move {
+                    let req: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    let method = req["method"].as_str().unwrap_or("").to_string();
+                    let id = req["id"].clone();
+                    eprintln!("[fixture {tag}] method={method} body={body}");
+                    let result = match method.as_str() {
+                        "initialize" => {
+                            hits.lock().unwrap().initialize.entry(tag.clone()).and_modify(|c| *c += 1).or_insert(1);
+                            serde_json::json!({
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": format!("fixture-{tag}"), "version": "0.0.1" }
+                            })
+                        }
+                        "tools/list" => {
+                            hits.lock().unwrap().tools_list.entry(tag.clone()).and_modify(|c| *c += 1).or_insert(1);
+                            serde_json::json!({
+                                "tools": [{
+                                    "name": format!("echo_{tag}"),
+                                    "description": "echo",
+                                    "inputSchema": {"type":"object","properties":{}}
+                                }]
+                            })
+                        }
+                        _ => serde_json::json!({}),
+                    };
+                    if id.is_null() {
+                        return axum::http::Response::builder()
+                            .status(202)
+                            .body(axum::body::Body::empty())
+                            .unwrap();
+                    }
+                    let resp = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
+                    axum::http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(resp.to_string()))
+                        .unwrap()
+                },
+            ),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/mcp"), hits)
+}
+
+/// Wait (bounded) for a condition on the fixture's counters.
+///
+/// MCP connections are made off the request path, so a bare assertion right
+/// after `session/new` would race the connection rather than observe it. Poll
+/// with a deadline instead — and take deltas against a baseline, because a
+/// counter's absolute value says nothing about which session caused it.
+async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..100 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    cond()
+}
+
+fn http_server(name: &str, url: String) -> acp::McpServer {
+    serde_json::from_value(serde_json::json!({
+        "type": "http", "name": name, "url": url, "headers": [],
+    }))
+    .expect("http mcp server")
+}
+
+// ---------------------------------------------------------------------------
+// T17 (E3) — an ordinary session really connects
+// T16 (E3) — a restricted session connects to nothing
+//
+// Each source gets its own URL path so a hit is attributable. Sharing one
+// endpoint between sources would let a test pass while only one of them ever
+// connected — which is exactly how the E4 gap below was found.
+//
+// SCOPE — E4 is deliberately absent here, and it is not an oversight:
+// `_meta["x.ai/mcp/servers"]` is not a URL-addressed server at all. It
+// registers *in-process SDK* servers as `[{ "name", "serverId" }]`, which the
+// agent invokes by sending `x.ai/mcp/sdk_call` back over the ACP reverse
+// channel (`session/acp_mcp.rs`). Its connection evidence therefore lives on
+// the gateway receiver, not on an HTTP endpoint, and asserting it here would
+// have meant asserting nothing. E1 (plugin) and E2 (managed, via the proxy
+// URL) are likewise still to come; see the tracking notes in the design doc.
+// ---------------------------------------------------------------------------
+
+local_test!(t17_ordinary_session_connects_per_source, async {
+    let (base, hits) = spawn_mcp_fixture().await;
+    let (a, tmp) = agent();
+    init(&a).await;
+
+    let mut req = acp::NewSessionRequest::new(tmp.path().to_path_buf());
+    req.mcp_servers = vec![http_server("e3-src", format!("{base}/e3"))];
+    a.new_session(req).await.expect("new session");
+
+    // A real handshake — `initialize` answered *and* `tools/list` issued —
+    // not merely presence in a merged config list.
+    let reached = wait_for(|| {
+        let h = hits.lock().unwrap();
+        h.initialize.get("e3").copied().unwrap_or(0) >= 1
+            && h.tools_list.get("e3").copied().unwrap_or(0) >= 1
+    })
+    .await;
+    let h = hits.lock().unwrap();
+    assert!(
+        reached,
+        "the request-supplied MCP server must complete a handshake;          initialize={:?} tools_list={:?}",
+        h.initialize, h.tools_list
+    );
+});
+
+local_test!(t16_restricted_session_connects_to_nothing, async {
+    let (base, hits) = spawn_mcp_fixture().await;
+    let (a, tmp) = agent();
+    init(&a).await;
+
+    // Baseline first: the assertion is a delta, so a hit from anything else
+    // can neither create nor mask a failure.
+    let baseline = {
+        let h = hits.lock().unwrap();
+        (h.initialize.len(), h.tools_list.len())
+    };
+
+    let mut req = acp::NewSessionRequest::new(tmp.path().to_path_buf());
+    req.mcp_servers = vec![http_server("e3-src", format!("{base}/e3"))];
+    req.meta = meta(serde_json::json!({ KEY: true }));
+    let resp = a.new_session(req).await.expect("new session");
+    assert_eq!(applied(&resp.meta), Some(&serde_json::Value::Bool(true)));
+
+    // Same wall-clock budget the positive test needed, so "no hits" means
+    // "did not connect" rather than "has not connected yet".
+    let connected = wait_for(|| !hits.lock().unwrap().initialize.is_empty()).await;
+    let h = hits.lock().unwrap();
+    assert!(
+        !connected,
+        "a restricted session must not connect to any MCP source; initialize={:?}",
+        h.initialize
+    );
+    assert_eq!((h.initialize.len(), h.tools_list.len()), baseline);
+});
