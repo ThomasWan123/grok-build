@@ -1158,3 +1158,116 @@ local_test!(t16_e4_restricted_session_makes_no_reverse_calls, async {
     );
     assert_eq!(calls.len(), baseline);
 });
+
+// ---------------------------------------------------------------------------
+// E1 — MCP contributed by an installed plugin
+//
+// Ordered so the negative half cannot pass for the wrong reason: the plugin is
+// proven live first (an ordinary session handshakes with it and the shared
+// registry is populated), and only then is a restricted session created and a
+// real broadcast fired at it. Asserting "no hits" against a plugin that was
+// never active would prove nothing at all.
+// ---------------------------------------------------------------------------
+
+/// A plugin whose MCP server is HTTP-addressed, so its connection lands on the
+/// same books as E3 but under its own tag.
+fn http_plugin_fixture(name: &str, url: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("plugin dir");
+    std::fs::write(
+        dir.path().join("plugin.json"),
+        format!(r#"{{"name": "{name}"}}"#),
+    )
+    .expect("plugin.json");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({ "mcpServers": { "e1-src": { "url": url } } }).to_string(),
+    )
+    .expect(".mcp.json");
+    dir
+}
+
+local_test!(t17_e1_plugin_mcp_connects_then_stays_away_from_restricted, async {
+    let (base, hits) = spawn_mcp_fixture().await;
+    let plugin = http_plugin_fixture("e1-plugin", &format!("{base}/e1"));
+    let (a, tmp) = agent_with_plugins(&[plugin.path()]);
+    init(&a).await;
+
+    // 1 — an ordinary session loads the plugin and its MCP server handshakes.
+    let ordinary = ordinary_session(&a, tmp.path()).await;
+    let connected = wait_for(|| {
+        let h = hits.lock().unwrap();
+        h.initialize.get("e1").copied().unwrap_or(0) >= 1
+            && h.tools_list.get("e1").copied().unwrap_or(0) >= 1
+    })
+    .await;
+    {
+        let h = hits.lock().unwrap();
+        assert!(
+            connected,
+            "the plugin's MCP server must complete a handshake for an ordinary              session; initialize={:?} tools_list={:?}",
+            h.initialize, h.tools_list
+        );
+    }
+
+    // 2 — and the shared registry really holds it.
+    assert_eq!(
+        a.session_raw_plugin_registry(&ordinary).await,
+        Some(Some(1)),
+        "the ordinary session must actually have the plugin loaded"
+    );
+
+    // 3 — now a restricted session, same plugin source, same connection.
+    let restricted_cwd = tempfile::tempdir().expect("cwd");
+    let baseline = {
+        let h = hits.lock().unwrap();
+        (
+            h.initialize.get("e1").copied().unwrap_or(0),
+            h.tools_list.get("e1").copied().unwrap_or(0),
+        )
+    };
+    let restricted = disabled_session(&a, restricted_cwd.path()).await;
+
+    // 4 — a real reload, driven by the ordinary session, fanned out process-wide.
+    ext(
+        &a,
+        "x.ai/plugins/action",
+        serde_json::json!({ "sessionId": ordinary.0, "action": { "type": "reload" } }),
+    )
+    .await
+    .expect("the ordinary session's reload must succeed");
+
+    // 5 — the restricted session must add nothing to E1's tally and hold no
+    // registry. Deltas, not absolutes: the ordinary session's own connection
+    // is legitimately on these books already.
+    //
+    // Any connection the restricted session might make gets the same budget
+    // the positive half needed, so a zero delta means "never connected" rather
+    // than "not yet".
+    let grew = wait_for(|| {
+        hits.lock().unwrap().initialize.get("e1").copied().unwrap_or(0) > baseline.0
+    })
+    .await;
+
+    assert_eq!(
+        a.session_raw_plugin_registry(&restricted).await,
+        Some(None),
+        "the restricted session's actor must hold no plugin registry"
+    );
+    let h = hits.lock().unwrap();
+    // Measured, not assumed: the ordinary session's reload re-merges its MCP
+    // config but reuses the live connection instead of re-handshaking, so E1's
+    // tally is stable across it — which is what makes any growth here
+    // attributable to the restricted session. If a future change makes reload
+    // reconnect, this fails loudly rather than quietly losing its meaning.
+    assert!(
+        !grew,
+        "no further E1 handshake may occur once the restricted session joins; \
+         baseline={} initialize={:?}",
+        baseline.0, h.initialize
+    );
+    assert_eq!(h.initialize.get("e1").copied().unwrap_or(0), baseline.0);
+    assert_eq!(h.tools_list.get("e1").copied().unwrap_or(0), baseline.1);
+    // Books stay separate: E1 must not show up under E3's tag or on the
+    // reverse channel's.
+    assert_eq!(h.initialize.get("e3").copied().unwrap_or(0), 0);
+});
