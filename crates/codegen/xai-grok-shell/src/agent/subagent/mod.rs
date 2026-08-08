@@ -40,7 +40,12 @@ use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod coordinator_lifecycle;
 mod coordinator_query;
+#[cfg(not(feature = "local-extensions-test-support"))]
 mod handle_request;
+/// Public only under the test-support feature, so the spawn path's
+/// materialization observation point is reachable from the integration target.
+#[cfg(feature = "local-extensions-test-support")]
+pub mod handle_request;
 pub(crate) use handle_request::handle_subagent_request;
 /// How the child session's initial context was bootstrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]

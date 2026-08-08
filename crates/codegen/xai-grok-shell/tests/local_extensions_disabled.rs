@@ -2207,3 +2207,267 @@ local_test!(t14_agent_defined_hooks_fire_for_code_and_never_for_restricted, asyn
         "and must add no sentinel line at all"
     );
 });
+
+// ---------------------------------------------------------------------------
+// Subagent fixture — the shared groundwork for T19/T20
+//
+// `resolve_agent_definition` falls back to `cfg.cli_agents` by name, so a full
+// `AgentDefinition` placed there is the cleanest way to give a subagent its own
+// inline hook and inline MCP server without touching disk discovery.
+// ---------------------------------------------------------------------------
+
+/// Marker carried in the prompt the parent hands its subagent.
+///
+/// The mock routes on message content, never on request order: with a parent
+/// turn, a subagent turn and a post-tool-result turn all hitting the same
+/// endpoint, ordering is exactly the thing that cannot be relied on.
+const SUBAGENT_PROMPT_MARKER: &str = "led-subagent-task-marker";
+const SUBAGENT_TYPE: &str = "led-subagent";
+
+/// Counts per routing state, so a test can prove each turn really happened.
+#[derive(Default, Debug)]
+struct ModelRouting {
+    parent_initial: usize,
+    subagent: usize,
+    parent_after_tool: usize,
+}
+
+async fn spawn_routing_model() -> (String, Arc<Mutex<ModelRouting>>) {
+    use axum::routing::post;
+    use axum::Router;
+
+    let routing: Arc<Mutex<ModelRouting>> = Arc::new(Mutex::new(ModelRouting::default()));
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |axum::extract::State(routing): axum::extract::State<Arc<Mutex<ModelRouting>>>,
+                 body: String| async move {
+                    // Routed on the *last* message, parsed — not on a substring
+                    // of the whole body. The marker also appears inside the
+                    // parent's own tool-call arguments once they are in history,
+                    // so a body-wide search misroutes every later parent turn to
+                    // the subagent branch.
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    let last = parsed["messages"]
+                        .as_array()
+                        .and_then(|m| m.last())
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let last_role = last["role"].as_str().unwrap_or_default().to_string();
+                    let last_text = last["content"].to_string();
+                    let has_marker =
+                        last_role == "user" && last_text.contains(SUBAGENT_PROMPT_MARKER);
+                    let has_tool_result = last_role == "tool";
+                    let delta = if has_marker {
+                        routing.lock().unwrap().subagent += 1;
+                        serde_json::json!({ "role": "assistant", "content": "subagent done" })
+                    } else if has_tool_result {
+                        routing.lock().unwrap().parent_after_tool += 1;
+                        serde_json::json!({ "role": "assistant", "content": "all done" })
+                    } else {
+                        routing.lock().unwrap().parent_initial += 1;
+                        serde_json::json!({
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_led_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "spawn_subagent",
+                                    "arguments": serde_json::json!({
+                                        "prompt": SUBAGENT_PROMPT_MARKER,
+                                        "description": "led probe",
+                                        "subagent_type": SUBAGENT_TYPE,
+                                        "background": false,
+                                    }).to_string()
+                                }
+                            }]
+                        })
+                    };
+                    let finish = if delta.get("tool_calls").is_some() {
+                        "tool_calls"
+                    } else {
+                        "stop"
+                    };
+                    let chunk = serde_json::json!({
+                        "id": "chatcmpl-led", "object": "chat.completion.chunk",
+                        "created": 0, "model": "led-mock",
+                        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }]
+                    });
+                    axum::response::sse::Sse::new(futures_util::stream::iter(vec![
+                        Ok::<_, std::convert::Infallible>(
+                            axum::response::sse::Event::default().data(chunk.to_string()),
+                        ),
+                        Ok(axum::response::sse::Event::default().data("[DONE]")),
+                    ]))
+                },
+            ),
+        )
+        .with_state(routing.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/v1"), routing)
+}
+
+/// The transport config for a single-key `mcpServers` entry: a real
+/// `acp::McpServer` minus its `name`.
+fn inline_mcp_config(name: &str, url: &str) -> serde_json::Value {
+    let dto = http_server(name, url.to_string());
+    let mut config = serde_json::to_value(&dto).expect("serialize mcp server");
+    config
+        .as_object_mut()
+        .expect("mcp server serializes to an object")
+        .remove("name");
+    config
+}
+
+/// An agent definition carrying both subagent injection sources at once.
+fn subagent_definition(script: &std::path::Path, mcp_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": SUBAGENT_TYPE,
+        "description": "subagent carrying an inline hook and an inline MCP server",
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{ "type": "command", "command": script.display().to_string() }]
+            }]
+        },
+        // Built from the typed DTO, not hand-written. `McpServerHttp.headers`
+        // is a required field with no serde default, so a hand-written config
+        // that omits it fails to deserialize — and the materialization branch
+        // drops such an entry silently, which reads as "the policy blocked it".
+        // Serializing a real `McpServer` guarantees every required field is
+        // present; only `name` is lifted out, because the single-key map form
+        // supplies it as the key.
+        "mcpServers": [ { "sub-src": inline_mcp_config("sub-src", mcp_url) } ]
+    })
+}
+
+/// Round-trips the fixture's MCP entry through the production shapes.
+///
+/// Written against the typed DTO rather than hand-written JSON: the earlier
+/// attempt guessed the wire form and produced an entry that deserialized
+/// happily but carried no transport `type`, so it never connected and nothing
+/// reported an error.
+#[test]
+fn subagent_inline_mcp_entry_round_trips_to_a_typed_dto() {
+    let url = "http://127.0.0.1:1/mcp/sub";
+    let dto: acp::McpServer = http_server("sub-src", url.to_string());
+
+    // Fixture form: the transport config alone, under the server name.
+    let mut config = serde_json::to_value(&dto).expect("serialize");
+    let obj = config.as_object_mut().expect("object");
+    obj.remove("name");
+    let entry = serde_json::json!({ "sub-src": config });
+
+    // Production form: the inline config is flattened and `name` restored.
+    let (name, mut inner) = entry
+        .as_object()
+        .and_then(|o| o.iter().next())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .expect("single-key map");
+    inner
+        .as_object_mut()
+        .expect("config object")
+        .insert("name".to_string(), serde_json::json!(name));
+    let back: acp::McpServer =
+        serde_json::from_value(inner).expect("inline config must deserialize as an McpServer");
+
+    assert_eq!(
+        serde_json::to_value(&back).unwrap(),
+        serde_json::to_value(&dto).unwrap(),
+        "the fixture entry must round-trip to the same server the DTO describes"
+    );
+}
+
+/// Build an agent whose catalog points at `model_url` and whose `cli_agents`
+/// carries the subagent definition.
+fn agent_with_subagent_fixture(
+    model_url: &str,
+    script: &std::path::Path,
+    mcp_url: &str,
+) -> (MvpAgent, tempfile::TempDir) {
+    scratch_home();
+    let temp = tempfile::tempdir().expect("temp dir");
+    seed_fresh_xai_oidc_auth(temp.path());
+    let auth = std::sync::Arc::new(xai_grok_shell::auth::AuthManager::new(
+        temp.path(),
+        xai_grok_shell::auth::GrokComConfig::default(),
+    ));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    GATEWAY_RX.with(|slot| *slot.borrow_mut() = Some(rx));
+    let gateway = xai_acp_lib::AcpAgentGatewaySender::new(tx);
+    let mut cfg = xai_grok_shell::agent::config::Config::default();
+    cfg.cli_agents = vec![
+        serde_json::from_value(subagent_definition(script, mcp_url))
+            .expect("agent definition parses"),
+    ];
+    let agent = MvpAgent::new(gateway, &cfg, auth, Some(mock_catalog(model_url)))
+        .expect("valid test config");
+    (agent, temp)
+}
+
+/// The positive control for T19/T20: an ordinary parent really does hand its
+/// subagent the definition's hook *and* its inline MCP server.
+///
+/// All three must hold before any "restricted subagents get nothing" claim
+/// means anything — a fixture that silently fails to deliver either one would
+/// make the negative half pass for the wrong reason. That is not hypothetical:
+/// this fixture materialized zero MCP servers until the config was built from a
+/// real DTO, because `McpServerHttp.headers` has no serde default and the
+/// materialization branch drops entries that fail to deserialize.
+local_test!(t19_positive_subagent_receives_definition_hook_and_mcp, async {
+    let hook_dir = tempfile::tempdir().expect("hook dir");
+    let (script, log) = hook_sentinel(hook_dir.path());
+    let (mcp_base, mcp_hits) = spawn_mcp_fixture().await;
+    let (model_url, routing) = spawn_routing_model().await;
+    let (a, tmp) =
+        agent_with_subagent_fixture(&model_url, &script, &format!("{mcp_base}/sub"));
+    init(&a).await;
+    let sid = ordinary_session(&a, tmp.path()).await;
+
+    a.prompt(acp::PromptRequest::new(
+        sid.clone(),
+        vec![acp::ContentBlock::from("please delegate")],
+    ))
+    .await
+    .expect("parent prompt");
+
+    // The delegation really happened, and the subagent really ran a turn.
+    {
+        let r = routing.lock().unwrap();
+        assert!(r.parent_initial >= 1, "parent must have been asked: {r:?}");
+        assert!(r.subagent >= 1, "the subagent must have run a turn: {r:?}");
+    }
+
+    // The definition carried the entry, and it survived materialization.
+    assert_eq!(
+        MvpAgent::last_subagent_def_mcp_count(),
+        1,
+        "the definition must carry exactly one MCP entry"
+    );
+    assert_eq!(
+        MvpAgent::last_subagent_mcp_servers(),
+        vec!["sub-src".to_string()],
+        "and it must materialize under its own name"
+    );
+
+    // Data plane: the server it materialized into actually handshook.
+    assert!(
+        wait_for(|| mcp_hits.lock().unwrap().initialize.get("sub").copied().unwrap_or(0) >= 1)
+            .await,
+        "the subagent's inline MCP server must complete a handshake; initialize={:?}",
+        mcp_hits.lock().unwrap().initialize
+    );
+
+    // And the definition's hook fired.
+    assert!(
+        wait_for(|| !hook_lines(&log).is_empty()).await,
+        "the subagent's inline hook must fire"
+    );
+});
+

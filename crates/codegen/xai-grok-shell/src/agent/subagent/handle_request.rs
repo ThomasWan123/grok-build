@@ -21,6 +21,14 @@ use crate::upload::trace::{
 };
 use crate::upload::turn::{PromptTraceContext, complete_prompt_trace};
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
+
+/// Names the last subagent spawn materialized from `AgentDefinition.mcp_servers`.
+#[cfg(feature = "local-extensions-test-support")]
+pub static LAST_AGENT_MCP_SERVERS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+/// How many entries the agent definition itself carried, before materialization.
+#[cfg(feature = "local-extensions-test-support")]
+pub static LAST_AGENT_DEF_MCP_COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 use xai_grok_tools::implementations::grok_build::task::types::*;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
@@ -1066,6 +1074,19 @@ pub(crate) async fn handle_subagent_request(
             subagent_id = % request.id, skills_count = skills_inherited_count,
             "Subagent inherited skills from parent"
         );
+    }
+    // Observation point (test-only): what the agent definition's `mcp_servers`
+    // actually materialized into. Distinguishes "the DTO conversion dropped it"
+    // from "it materialized but never connected" — two failures that look
+    // identical from the endpoint's side.
+    #[cfg(feature = "local-extensions-test-support")]
+    {
+        let names: Vec<String> = agent_mcp_servers
+            .iter()
+            .map(|s| crate::session::mcp_servers::mcp_server_name(s).to_string())
+            .collect();
+        *LAST_AGENT_MCP_SERVERS.lock().unwrap() = names;
+        *LAST_AGENT_DEF_MCP_COUNT.lock().unwrap() = definition.mcp_servers.len();
     }
     let mcp_owned_count = agent_mcp_servers.len() as u32;
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentLaunched {

@@ -405,6 +405,22 @@ impl MvpAgent {
             handle.test_execute_slash_command(command).await;
         }
     }
+    /// Names the last subagent spawn materialized from its agent definition's
+    /// `mcp_servers` (test-only observation point).
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn last_subagent_mcp_servers() -> Vec<String> {
+        crate::agent::subagent::handle_request::LAST_AGENT_MCP_SERVERS
+            .lock()
+            .unwrap()
+            .clone()
+    }
+    /// Entry count the last subagent's definition carried before materialization.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn last_subagent_def_mcp_count() -> usize {
+        *crate::agent::subagent::handle_request::LAST_AGENT_DEF_MCP_COUNT
+            .lock()
+            .unwrap()
+    }
     /// The session actor's **own** plugin registry, asked of the actor itself.
     ///
     /// `None` — no such session. `Some(None)` — the actor holds no registry.
