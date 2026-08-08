@@ -21,6 +21,10 @@ use agent_client_protocol::Agent as _;
 use xai_grok_shell::agent::MvpAgent;
 
 thread_local! {
+    /// Data-plane URL the managed-config endpoint advertises for `e2-src`.
+    /// Set once the fixture's port is known, since the URL embeds it.
+    static MANAGED_ENDPOINT: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
     /// Receiver half of the gateway the most recently built agent writes to.
     ///
     /// Handed over rather than dropped so a test can answer reverse requests:
@@ -69,10 +73,50 @@ fn agent() -> (MvpAgent, tempfile::TempDir) {
 }
 
 fn agent_with_plugins(plugin_dirs: &[&std::path::Path]) -> (MvpAgent, tempfile::TempDir) {
+    agent_full(plugin_dirs, None)
+}
+
+/// Seed `auth.json` with a WebLogin credential.
+///
+/// Managed MCP is gated on `is_managed_mcp_eligible()`, which the bare
+/// `XAI_API_KEY` path does not satisfy — without this the fetch never happens
+/// and an E2 test would "pass" by never exercising anything.
+#[allow(dead_code)]
+fn seed_web_login_auth(dir: &std::path::Path) {
+    let scope = xai_grok_shell::auth::GrokComConfig::default().auth_scope();
+    let auth = xai_grok_shell::auth::GrokAuth {
+        key: "test-managed-key".into(),
+        auth_mode: xai_grok_shell::auth::AuthMode::WebLogin,
+        user_id: "test-user".into(),
+        ..Default::default()
+    };
+    let store = serde_json::json!({ scope: auth });
+    std::fs::write(
+        dir.join("auth.json"),
+        serde_json::to_string(&store).expect("auth store"),
+    )
+    .expect("write auth.json");
+}
+
+#[allow(dead_code)]
+fn agent_full(
+    plugin_dirs: &[&std::path::Path],
+    managed_proxy_url: Option<&str>,
+) -> (MvpAgent, tempfile::TempDir) {
     let temp = tempfile::tempdir().expect("temp dir");
+    if managed_proxy_url.is_some() {
+        seed_web_login_auth(temp.path());
+    }
     unsafe {
         std::env::set_var("XAI_API_KEY", "test-key");
         std::env::set_var("GROK_HOME", temp.path());
+        // `MvpAgent::new` re-resolves the config through `resolve_config`, which
+        // rebuilds `endpoints` from env/disk — so the proxy URL has to be set
+        // where that resolution can see it, not only on the struct we pass in.
+        match managed_proxy_url {
+            Some(url) => std::env::set_var("GROK_CLI_CHAT_PROXY_BASE_URL", url),
+            None => std::env::remove_var("GROK_CLI_CHAT_PROXY_BASE_URL"),
+        }
     }
     let auth = std::sync::Arc::new(xai_grok_shell::auth::AuthManager::new(
         temp.path(),
@@ -83,6 +127,11 @@ fn agent_with_plugins(plugin_dirs: &[&std::path::Path]) -> (MvpAgent, tempfile::
     let gateway = xai_acp_lib::AcpAgentGatewaySender::new(tx);
     let mut cfg = xai_grok_shell::agent::config::Config::default();
     cfg.plugins.cli_plugin_dirs = plugin_dirs.iter().map(|p| p.to_path_buf()).collect();
+    if let Some(url) = managed_proxy_url {
+        cfg.managed_mcps_enabled = true;
+        cfg.managed_mcp_gateway_tools_enabled = false;
+        cfg.endpoints.cli_chat_proxy_base_url = Some(url.to_string());
+    }
     let agent = MvpAgent::new(gateway, &cfg, auth, None).expect("valid test config");
     (agent, temp)
 }
@@ -825,6 +874,16 @@ use std::sync::{Arc, Mutex};
 struct Hits {
     initialize: HashMap<String, usize>,
     tools_list: HashMap<String, usize>,
+    /// Control-plane: requests to the managed-MCP list endpoint. Counted
+    /// separately from the data plane because "the list was fetched" and "the
+    /// listed server was connected to" are different claims, and E2 needs both.
+    managed_configs: usize,
+}
+
+/// The proxy base URL a managed-MCP-enabled agent should be pointed at.
+#[allow(dead_code)]
+fn proxy_base(mcp_base: &str) -> String {
+    mcp_base.trim_end_matches("/mcp").to_string() + "/proxy"
 }
 
 async fn spawn_mcp_fixture() -> (String, Arc<Mutex<Hits>>) {
@@ -834,6 +893,20 @@ async fn spawn_mcp_fixture() -> (String, Arc<Mutex<Hits>>) {
 
     let hits: Arc<Mutex<Hits>> = Arc::new(Mutex::new(Hits::default()));
     let app = Router::new()
+        .route(
+            "/proxy/mcp/configs",
+            axum::routing::get(
+                |State(hits): State<Arc<Mutex<Hits>>>| async move {
+                    hits.lock().unwrap().managed_configs += 1;
+                    let base = MANAGED_ENDPOINT.with(|c| c.borrow().clone());
+                    axum::Json(serde_json::json!({
+                        "mcpServers": [
+                            { "name": "e2-src", "endpoint": base, "headers": {} }
+                        ]
+                    }))
+                },
+            ),
+        )
         .route(
             "/mcp/{tag}",
             post(
@@ -887,7 +960,11 @@ async fn spawn_mcp_fixture() -> (String, Arc<Mutex<Hits>>) {
     tokio::task::spawn_local(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://{addr}/mcp"), hits)
+    let mcp_base = format!("http://{addr}/mcp");
+    // The managed-config endpoint advertises a data-plane URL, so it can only
+    // be filled in once the port is known.
+    MANAGED_ENDPOINT.with(|c| *c.borrow_mut() = format!("{mcp_base}/e2"));
+    (mcp_base, hits)
 }
 
 /// Wait (bounded) for a condition on the fixture's counters.
@@ -1271,3 +1348,33 @@ local_test!(t17_e1_plugin_mcp_connects_then_stays_away_from_restricted, async {
     // reverse channel's.
     assert_eq!(h.initialize.get("e3").copied().unwrap_or(0), 0);
 });
+
+// ---------------------------------------------------------------------------
+// E2 — managed MCP, fetched from the proxy
+//
+// Two planes, counted separately, because they are two different claims:
+//   control — the managed list endpoint was actually asked;
+//   data    — the single server it returned actually handshook.
+// A test that only checked one of them would pass while the other never
+// happened.
+//
+// The negative half uses its **own** `MvpAgent`, identically configured, with
+// only a restricted session on it. Reusing the positive agent would let a
+// populated managed cache supply the "zero fetches" result, which proves
+// nothing about the policy.
+// ---------------------------------------------------------------------------
+
+// NOT YET IMPLEMENTED — the positive half does not fire, so no assertion is
+// written here rather than leaving one that is `#[ignore]`d (a silenced test
+// reads as coverage it is not). State of the investigation:
+//
+//   * `/proxy/mcp/configs` is wired and counted; `MANAGED_ENDPOINT` advertises
+//     a data-plane URL under its own `e2` tag, so both planes are ready;
+//   * `cli_chat_proxy_base_url` is set on the config *and* via
+//     `GROK_CLI_CHAT_PROXY_BASE_URL`, because `MvpAgent::new` re-resolves the
+//     config through `resolve_config`;
+//   * the control plane is still never hit, so `can_fetch_managed_mcps()` is
+//     returning false. Its remaining input is `has_managed_mcp_auth()`, which
+//     needs `is_xai_auth() || AuthMode::WebLogin` — `seed_web_login_auth`
+//     writes such a credential to `auth.json`, so the next step is to confirm
+//     that store is actually loaded and that `AuthMode`'s serde name matches.
