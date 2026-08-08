@@ -370,6 +370,32 @@ impl MvpAgent {
     pub fn ensure_plugin_registry_call_count(&self) -> u32 {
         self.ensure_plugin_registry_calls.get()
     }
+    /// Drop a session from the live map so a following `session/load` is a
+    /// real load rather than a reconnect to a handle that is already there.
+    ///
+    /// Only removes the map entry; the actor thread is left to wind down on
+    /// its own, which is all a test needs to enter the loading window.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn remove_session_for_test(&self, session_id: &acp::SessionId) {
+        self.sessions.borrow_mut().remove(session_id);
+    }
+    /// Install a pause point inside `session/load` (see [`TestLoadBarrier`]).
+    ///
+    /// The returned handle is shared with the agent; the caller releases it.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn install_load_barrier(&self) -> std::sync::Arc<super::TestLoadBarrier> {
+        let barrier = std::sync::Arc::new(super::TestLoadBarrier::new());
+        *self.load_barrier.borrow_mut() = Some(barrier.clone());
+        barrier
+    }
+    /// Hold at the installed barrier, if any. No-op when none is installed.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub(super) async fn hold_at_load_barrier(&self) {
+        let barrier = self.load_barrier.borrow().clone();
+        if let Some(barrier) = barrier {
+            barrier.hold().await;
+        }
+    }
     /// The session actor's **own** plugin registry, asked of the actor itself.
     ///
     /// `None` — no such session. `Some(None)` — the actor holds no registry.
@@ -1567,6 +1593,8 @@ impl MvpAgent {
             plugin_registry_initialized: std::cell::Cell::new(false),
             #[cfg(feature = "local-extensions-test-support")]
             ensure_plugin_registry_calls: std::cell::Cell::new(0),
+            #[cfg(feature = "local-extensions-test-support")]
+            load_barrier: RefCell::new(None),
             persona_io_summaries: cfg
                 .subagent_personas
                 .iter()

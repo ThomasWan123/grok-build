@@ -1330,6 +1330,13 @@ impl acp::Agent for MvpAgent {
             );
             return Err(super::local_extensions_disabled_error("immutable_conflict"));
         }
+        // Test-only pause point: the load is registered as in flight (the
+        // guard above) but no handle has been inserted into `sessions` yet,
+        // which is exactly the window `session_handle_waiting_for_load`
+        // exists to cover. Placed after the conflict check so a refused load
+        // still returns immediately and stays side-effect free.
+        #[cfg(feature = "local-extensions-test-support")]
+        self.hold_at_load_barrier().await;
         self.sweep_dead_sessions();
         self.drain_old_session_thread(&arguments.session_id).await;
         tracing::debug!("Received load session request {arguments:?}");

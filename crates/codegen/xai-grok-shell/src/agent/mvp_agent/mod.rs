@@ -168,6 +168,88 @@ pub(crate) fn parse_local_extensions_disabled(
         ),
     }
 }
+/// Deterministic pause point inside `session/load`, for tests only.
+///
+/// Exists because the ordering that `plugins/list` depends on — read the
+/// policy *after* awaiting the handle, so a session still loading is waited
+/// for rather than reported unknown — is only observable while a load is
+/// genuinely in flight. Without a way to hold a load open, that window cannot
+/// be entered deterministically, and the ordering would be pinned by nothing
+/// but a comment.
+///
+/// Compiled only under `local-extensions-test-support`; in a default build
+/// neither this type nor its await point exists.
+#[cfg(feature = "local-extensions-test-support")]
+pub struct TestLoadBarrier {
+    reached_tx: tokio::sync::watch::Sender<bool>,
+    reached_rx: tokio::sync::watch::Receiver<bool>,
+    release_tx: tokio::sync::watch::Sender<bool>,
+    release_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(feature = "local-extensions-test-support")]
+impl Default for TestLoadBarrier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "local-extensions-test-support")]
+impl TestLoadBarrier {
+    /// Every wait here is bounded. A test that mis-sequences its steps must
+    /// fail, not hang: an unbounded barrier turns an assertion bug into a
+    /// stuck CI job, and a stuck job gets silenced rather than fixed.
+    const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    pub fn new() -> Self {
+        let (reached_tx, reached_rx) = tokio::sync::watch::channel(false);
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        Self {
+            reached_tx,
+            reached_rx,
+            release_tx,
+            release_rx,
+        }
+    }
+
+    /// Called from `session/load`: announce arrival, then wait to be released.
+    pub(crate) async fn hold(&self) {
+        let _ = self.reached_tx.send(true);
+        let mut rx = self.release_rx.clone();
+        let deadline = tokio::time::Instant::now() + Self::WAIT_TIMEOUT;
+        while !*rx.borrow() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                tracing::warn!("test load barrier timed out; releasing");
+                return;
+            }
+            if tokio::time::timeout(deadline - now, rx.changed()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Wait (bounded) until a load has actually reached the barrier.
+    ///
+    /// Returns `false` on timeout so the caller can assert rather than hang.
+    pub async fn wait_until_reached(&self) -> bool {
+        let mut rx = self.reached_rx.clone();
+        let deadline = tokio::time::Instant::now() + Self::WAIT_TIMEOUT;
+        while !*rx.borrow() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline || tokio::time::timeout(deadline - now, rx.changed()).await.is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn release(&self) {
+        let _ = self.release_tx.send(true);
+    }
+}
+
 /// Marks a notification's meta field with `isReplay: true` for replayed session updates.
 /// If `persist_data` is provided, it will be included in the meta under `x.ai/persist`.
 /// Extract the numeric `tier` claim from a JWT access token (no signature
@@ -914,6 +996,9 @@ pub struct MvpAgent {
     /// without `cfg(test)`.
     #[cfg(feature = "local-extensions-test-support")]
     pub(crate) ensure_plugin_registry_calls: std::cell::Cell<u32>,
+    /// Installed by a test to hold `session/load` open; see [`TestLoadBarrier`].
+    #[cfg(feature = "local-extensions-test-support")]
+    pub(crate) load_barrier: RefCell<Option<std::sync::Arc<TestLoadBarrier>>>,
     persona_io_summaries: Vec<String>,
     /// Single-flight guard for the proactive bundle sync background task.
     ///

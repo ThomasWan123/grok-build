@@ -709,3 +709,94 @@ local_test!(t8_load_cannot_restrict_a_running_ordinary_session, async {
         "the running session keeps the policy it was created with"
     );
 });
+
+// ---------------------------------------------------------------------------
+// T24 (load race) — a request arriving mid-load waits instead of being
+// answered as if the session did not exist
+// ---------------------------------------------------------------------------
+
+local_test!(t24_plugins_list_waits_for_an_in_flight_load, async {
+    let fixture = plugin_fixture("t24-fixture-plugin");
+    let (a, tmp) = agent_with_plugins(&[fixture.path()]);
+    let a = std::rc::Rc::new(a);
+    init(&a).await;
+
+    // Create an ordinary session, then drop its actor so the reload below is
+    // a genuine load rather than a reconnect to a live handle.
+    let sid = ordinary_session(&a, tmp.path()).await;
+    assert_eq!(a.session_raw_plugin_registry(&sid).await, Some(Some(1)));
+    a.remove_session_for_test(&sid);
+    assert_eq!(
+        a.session_local_extensions_disabled_snapshot(&sid),
+        None,
+        "the session must be out of the map so the load really re-creates it"
+    );
+
+    let barrier = a.install_load_barrier();
+
+    let load = {
+        let a = a.clone();
+        let sid = sid.clone();
+        let cwd = tmp.path().to_path_buf();
+        tokio::task::spawn_local(async move { load_session(&a, &sid, &cwd, None).await })
+    };
+
+    // The load is now registered as in flight, and no handle is in `sessions`.
+    assert!(
+        barrier.wait_until_reached().await,
+        "the load must reach the barrier"
+    );
+    assert_eq!(
+        a.session_local_extensions_disabled_snapshot(&sid),
+        None,
+        "handle must not be installed yet — otherwise this proves nothing"
+    );
+
+    // A `plugins/list` issued in this window must wait for the load rather
+    // than treat the session as unknown. Checking the policy before awaiting
+    // the handle would answer empty here, which is what T24 forbids.
+    let listing = {
+        let a = a.clone();
+        let sid = sid.clone();
+        tokio::task::spawn_local(async move {
+            ext(
+                &a,
+                "x.ai/plugins/list",
+                serde_json::json!({ "sessionId": sid.0 }),
+            )
+            .await
+        })
+    };
+
+    // An unknown id must not be caught by that wait: it has no load in flight,
+    // so it answers immediately even while another session is mid-load.
+    let unknown = acp::SessionId::new("00000000-0000-0000-0000-0000000000fe");
+    let unknown_listing = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ext(
+            &a,
+            "x.ai/plugins/list",
+            serde_json::json!({ "sessionId": unknown.0 }),
+        ),
+    )
+    .await
+    .expect("an unknown id must not wait on an unrelated in-flight load")
+    .expect("plugins/list");
+    assert_eq!(unknown_listing, serde_json::json!({ "plugins": [] }));
+
+    barrier.release();
+    load.await
+        .expect("load task")
+        .expect("load must succeed");
+
+    let listing = tokio::time::timeout(std::time::Duration::from_secs(10), listing)
+        .await
+        .expect("the waiting plugins/list must complete once the load lands")
+        .expect("list task")
+        .expect("plugins/list");
+    assert_eq!(
+        listing["plugins"].as_array().map(Vec::len),
+        Some(1),
+        "the waiting request must be answered from the loaded session's own          registry, not with the empty fail-closed answer"
+    );
+});
