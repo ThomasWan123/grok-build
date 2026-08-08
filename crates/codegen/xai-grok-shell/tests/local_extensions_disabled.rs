@@ -1731,12 +1731,12 @@ fn agent_with_model_and_plugins(
     (agent, temp)
 }
 
-/// Guards the turn harness itself.
-///
-/// T14, T19/T20 and T23 all rest on a session being able to complete a prompt.
-/// If that ever stops working those tests would go quiet in a way that reads
-/// like "the policy blocked it", so the ability to run a turn at all is pinned
-/// separately.
+// Guards the turn harness itself.
+//
+// T14, T19/T20 and T23 all rest on a session being able to complete a prompt.
+// If that ever stops working those tests would go quiet in a way that reads
+// like "the policy blocked it", so the ability to run a turn at all is pinned
+// separately.
 local_test!(turn_harness_completes_a_prompt, async {
     let (model_url, model_hits) = spawn_mock_model().await;
     let (a, tmp) = agent_with_model(&model_url);
@@ -1799,23 +1799,6 @@ fn refusal_meta(notifications: &Arc<Mutex<Vec<serde_json::Value>>>) -> Vec<serde
         .filter(|m| m.get("code").and_then(|c| c.as_str()) == Some("local_extensions_disabled"))
         .collect()
 }
-
-/// Every extension arm, with arguments its parser accepts.
-const EXTENSION_COMMANDS: &[&str] = &[
-    "/hooks-trust",
-    "/hooks-list",
-    "/hooks-add C:/tmp/led-hook.json",
-    "/hooks-remove C:/tmp/led-hook.json",
-    "/hooks-untrust",
-    "/plugins list",
-    "/plugins reload",
-    "/plugins trust C:/tmp/led-plugin",
-    "/plugins add C:/tmp/led-plugin",
-    "/plugins remove C:/tmp/led-plugin",
-    "/plugins install C:/tmp/led-plugin",
-    "/plugins uninstall led-plugin",
-    "/plugins update led-plugin",
-];
 
 /// Command names the session advertises, from an `available_commands_update`.
 fn advertised_commands(notifications: &Arc<Mutex<Vec<serde_json::Value>>>) -> Vec<String> {
@@ -2393,16 +2376,6 @@ fn subagent_inline_mcp_entry_round_trips_to_a_typed_dto() {
     );
 }
 
-/// Build an agent whose catalog points at `model_url` and whose `cli_agents`
-/// carries the subagent definition.
-fn agent_with_subagent_fixture(
-    model_url: &str,
-    script: &std::path::Path,
-    mcp_url: &str,
-) -> (MvpAgent, tempfile::TempDir) {
-    agent_with_subagent_fixture_and_plugins(model_url, script, mcp_url, &[])
-}
-
 fn agent_with_subagent_fixture_and_plugins(
     model_url: &str,
     script: &std::path::Path,
@@ -2430,15 +2403,15 @@ fn agent_with_subagent_fixture_and_plugins(
     (agent, temp)
 }
 
-/// The positive control for T19/T20: an ordinary parent really does hand its
-/// subagent the definition's hook *and* its inline MCP server.
-///
-/// All three must hold before any "restricted subagents get nothing" claim
-/// means anything — a fixture that silently fails to deliver either one would
-/// make the negative half pass for the wrong reason. That is not hypothetical:
-/// this fixture materialized zero MCP servers until the config was built from a
-/// real DTO, because `McpServerHttp.headers` has no serde default and the
-/// materialization branch drops entries that fail to deserialize.
+// The positive control for T19/T20: an ordinary parent really does hand its
+// subagent the definition's hook *and* its inline MCP server.
+//
+// All three must hold before any "restricted subagents get nothing" claim
+// means anything — a fixture that silently fails to deliver either one would
+// make the negative half pass for the wrong reason. That is not hypothetical:
+// this fixture materialized zero MCP servers until the config was built from a
+// real DTO, because `McpServerHttp.headers` has no serde default and the
+// materialization branch drops entries that fail to deserialize.
 local_test!(t19_positive_subagent_receives_definition_hook_and_mcp, async {
     let hook_dir = tempfile::tempdir().expect("hook dir");
     let (script, log) = hook_sentinel(hook_dir.path());
