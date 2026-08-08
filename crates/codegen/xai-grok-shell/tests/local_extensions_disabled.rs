@@ -36,6 +36,9 @@ thread_local! {
     > = const { std::cell::RefCell::new(None) };
 }
 
+/// Bearer the seeded credential carries; asserted on the control-plane request
+/// so the test proves an *authenticated* fetch, not merely a reachable URL.
+const TEST_BEARER: &str = "test-managed-oidc-token";
 const KEY: &str = "x.ai/localExtensionsDisabled";
 const APPLIED: &str = "localExtensionsDisabledApplied";
 
@@ -76,21 +79,35 @@ fn agent_with_plugins(plugin_dirs: &[&std::path::Path]) -> (MvpAgent, tempfile::
     agent_full(plugin_dirs, None)
 }
 
-/// Seed `auth.json` with a WebLogin credential.
+/// Seed `auth.json` with a fresh first-party OIDC credential.
 ///
-/// Managed MCP is gated on `is_managed_mcp_eligible()`, which the bare
-/// `XAI_API_KEY` path does not satisfy — without this the fetch never happens
-/// and an E2 test would "pass" by never exercising anything.
-#[allow(dead_code)]
-fn seed_web_login_auth(dir: &std::path::Path) {
+/// Managed MCP is gated on `is_managed_mcp_eligible()`. `WebLogin` looks like
+/// it would satisfy that gate but does not: it is deprecated, and `lookup_auth`
+/// skips such entries outright, so the store loads and the credential still
+/// resolves to `None`. `is_xai_auth()` additionally requires the issuer to be
+/// x.ai — an OIDC credential without `oidc_issuer` does not qualify either.
+///
+/// Both halves of E2 use this same credential, so the negative half cannot
+/// pass merely because its agent had no usable auth.
+fn seed_fresh_xai_oidc_auth(dir: &std::path::Path) {
     let scope = xai_grok_shell::auth::GrokComConfig::default().auth_scope();
-    let auth = xai_grok_shell::auth::GrokAuth {
-        key: "test-managed-key".into(),
-        auth_mode: xai_grok_shell::auth::AuthMode::WebLogin,
-        user_id: "test-user".into(),
-        ..Default::default()
-    };
-    let store = serde_json::json!({ scope: auth });
+    let now = chrono::Utc::now();
+    let store = serde_json::json!({
+        scope: {
+            "key": TEST_BEARER,
+            "auth_mode": "oidc",
+            "create_time": now,
+            "user_id": "test-user",
+            "email": serde_json::Value::Null,
+            "refresh_token": "test-refresh-token",
+            // Must be in the future, or the credential resolves as expired.
+            "expires_at": now + chrono::Duration::hours(6),
+            // Without an x.ai issuer `is_xai_auth()` is false and the managed
+            // gate stays shut.
+            "oidc_issuer": xai_grok_shell::auth::XAI_OAUTH2_ISSUER,
+            "oidc_client_id": "test-client-id",
+        }
+    });
     std::fs::write(
         dir.join("auth.json"),
         serde_json::to_string(&store).expect("auth store"),
@@ -105,7 +122,7 @@ fn agent_full(
 ) -> (MvpAgent, tempfile::TempDir) {
     let temp = tempfile::tempdir().expect("temp dir");
     if managed_proxy_url.is_some() {
-        seed_web_login_auth(temp.path());
+        seed_fresh_xai_oidc_auth(temp.path());
     }
     unsafe {
         std::env::set_var("XAI_API_KEY", "test-key");
@@ -878,6 +895,10 @@ struct Hits {
     /// separately from the data plane because "the list was fetched" and "the
     /// listed server was connected to" are different claims, and E2 needs both.
     managed_configs: usize,
+    /// Bearer tokens seen on the control plane, so the test can assert the
+    /// fetch was authenticated with the seeded credential rather than merely
+    /// that the URL was reachable.
+    managed_bearers: Vec<String>,
 }
 
 /// The proxy base URL a managed-MCP-enabled agent should be pointed at.
@@ -896,12 +917,34 @@ async fn spawn_mcp_fixture() -> (String, Arc<Mutex<Hits>>) {
         .route(
             "/proxy/mcp/configs",
             axum::routing::get(
-                |State(hits): State<Arc<Mutex<Hits>>>| async move {
-                    hits.lock().unwrap().managed_configs += 1;
+                |State(hits): State<Arc<Mutex<Hits>>>,
+                 headers: axum::http::HeaderMap| async move {
+                    {
+                        let mut h = hits.lock().unwrap();
+                        h.managed_configs += 1;
+                        if let Some(auth) = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                        {
+                            h.managed_bearers.push(auth.to_string());
+                        }
+                    }
                     let base = MANAGED_ENDPOINT.with(|c| c.borrow().clone());
+                    // Non-empty headers are required: `auto_inject_managed_
+                    // servers_with_disabled` skips any managed config with an
+                    // empty header map, so an empty one is listed on the
+                    // control plane and then silently never connected.
+                    // `McpConfigsResponse` carries no `rename_all`, so the
+                    // field is snake_case. A camelCase body fails to parse,
+                    // which surfaces as an empty list plus a retry — i.e. a
+                    // busy control plane and a silent data plane.
                     axum::Json(serde_json::json!({
-                        "mcpServers": [
-                            { "name": "e2-src", "endpoint": base, "headers": {} }
+                        "mcp_servers": [
+                            {
+                                "name": "e2-src",
+                                "endpoint": base,
+                                "headers": { "Authorization": "Bearer managed-e2" }
+                            }
                         ]
                     }))
                 },
@@ -1364,17 +1407,50 @@ local_test!(t17_e1_plugin_mcp_connects_then_stays_away_from_restricted, async {
 // nothing about the policy.
 // ---------------------------------------------------------------------------
 
-// NOT YET IMPLEMENTED — the positive half does not fire, so no assertion is
-// written here rather than leaving one that is `#[ignore]`d (a silenced test
-// reads as coverage it is not). State of the investigation:
+local_test!(t17_e2_managed_mcp_control_and_data_plane, async {
+    let (base, hits) = spawn_mcp_fixture().await;
+    let proxy = proxy_base(&base);
+    let (a, tmp) = agent_full(&[], Some(&proxy));
+    init(&a).await;
+    ordinary_session(&a, tmp.path()).await;
+
+    let ok = wait_for(|| {
+        let h = hits.lock().unwrap();
+        h.managed_configs >= 1
+            && h.initialize.get("e2").copied().unwrap_or(0) >= 1
+            && h.tools_list.get("e2").copied().unwrap_or(0) >= 1
+    })
+    .await;
+    let h = hits.lock().unwrap();
+    assert!(
+        ok,
+        "managed MCP must be listed *and* connected; managed_configs={}          initialize={:?} tools_list={:?}",
+        h.managed_configs, h.initialize, h.tools_list
+    );
+    // The control-plane request must carry the seeded credential: a fetch that
+    // reached the URL unauthenticated would be a different (and broken) thing.
+    assert!(
+        h.managed_bearers.iter().any(|b| b.contains(TEST_BEARER)),
+        "the managed fetch must be authenticated with the seeded token; saw {:?}",
+        h.managed_bearers
+    );
+});
+
+// T16-E2 — NOT YET IMPLEMENTED. The negative half needs a *second*, separately
+// cached `MvpAgent` (a shared cache would let "zero fetches" be a cache hit
+// rather than a policy decision), and building one in the same process
+// currently aborts with STATUS_HEAP_CORRUPTION.
 //
-//   * `/proxy/mcp/configs` is wired and counted; `MANAGED_ENDPOINT` advertises
-//     a data-plane URL under its own `e2` tag, so both planes are ready;
-//   * `cli_chat_proxy_base_url` is set on the config *and* via
-//     `GROK_CLI_CHAT_PROXY_BASE_URL`, because `MvpAgent::new` re-resolves the
-//     config through `resolve_config`;
-//   * the control plane is still never hit, so `can_fetch_managed_mcps()` is
-//     returning false. Its remaining input is `has_managed_mcp_auth()`, which
-//     needs `is_xai_auth() || AuthMode::WebLogin` — `seed_web_login_auth`
-//     writes such a credential to `auth.json`, so the next step is to confirm
-//     that store is actually loaded and that `AuthMode`'s serde name matches.
+// The cause is in this test harness, not the engine: `agent_full` sets
+// `GROK_HOME` / `GROK_CLI_CHAT_PROXY_BASE_URL` through `std::env::set_var`,
+// which is unsound once other threads exist — and the first agent's reqwest and
+// MCP worker threads are still alive and do read the environment. Two agents in
+// one process therefore race on the environment block.
+//
+// The fix is to stop mutating the environment per agent (pass the home
+// directory through the API and set process-wide values exactly once), not to
+// weaken the negative evidence to a single shared agent.
+//
+// Positive half (T17-E2) is proven: the control plane is hit with the seeded
+// bearer and `/mcp/e2` completes a full three-step handshake.
+
