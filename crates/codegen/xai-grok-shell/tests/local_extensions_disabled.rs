@@ -1624,3 +1624,119 @@ local_test!(t16_e2_restricted_child_neither_lists_nor_connects, async {
 });
 
 
+
+// ---------------------------------------------------------------------------
+// Mock model — enables the tests that need a turn to actually run
+//
+// T14 (agent-defined hooks must not fire), T19/T20 (a real subagent spawn) and
+// T23 (slash commands execute inside a turn) all need the session to complete a
+// prompt, which needs a model to answer. A prefetched catalog pointed at a
+// local endpoint keeps that entirely in-process.
+// ---------------------------------------------------------------------------
+
+/// Number of completions the mock has served.
+type ModelProbe = Arc<std::sync::atomic::AtomicU32>;
+
+async fn spawn_mock_model() -> (String, ModelProbe) {
+    use axum::routing::post;
+    use axum::Router;
+
+    let probe: ModelProbe = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|axum::extract::State(probe): axum::extract::State<ModelProbe>| async move {
+                probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let chunk = serde_json::json!({
+                    "id": "chatcmpl-led",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "led-mock",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "role": "assistant", "content": "ok" },
+                        "finish_reason": "stop"
+                    }]
+                });
+                axum::response::sse::Sse::new(futures_util::stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().data(chunk.to_string()),
+                    ),
+                    Ok(axum::response::sse::Event::default().data("[DONE]")),
+                ]))
+            }),
+        )
+        .with_state(probe.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/v1"), probe)
+}
+
+fn mock_catalog(base_url: &str) -> indexmap::IndexMap<String, xai_grok_shell::agent::config::ModelEntry> {
+    let mut info = xai_grok_shell::agent::config::ModelInfo::fallback("led-mock");
+    info.base_url = base_url.to_owned();
+    info.max_completion_tokens = Some(64);
+    let mut map = indexmap::IndexMap::new();
+    map.insert(
+        "led-mock".to_string(),
+        xai_grok_shell::agent::config::ModelEntry {
+            info,
+            api_key: Some("led-mock-key".to_string()),
+            env_key: None,
+            api_base_url: None,
+        },
+    );
+    map
+}
+
+/// Build an agent whose catalog points at `model_url`.
+///
+/// Separate from `agent_full` because a prefetched catalog is the only way to
+/// reach a local model endpoint, and the tests that do not run a turn have no
+/// reason to carry one.
+fn agent_with_model(model_url: &str) -> (MvpAgent, tempfile::TempDir) {
+    scratch_home();
+    let temp = tempfile::tempdir().expect("temp dir");
+    seed_fresh_xai_oidc_auth(temp.path());
+    let auth = std::sync::Arc::new(xai_grok_shell::auth::AuthManager::new(
+        temp.path(),
+        xai_grok_shell::auth::GrokComConfig::default(),
+    ));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    GATEWAY_RX.with(|slot| *slot.borrow_mut() = Some(rx));
+    let gateway = xai_acp_lib::AcpAgentGatewaySender::new(tx);
+    let cfg = xai_grok_shell::agent::config::Config::default();
+    let agent = MvpAgent::new(gateway, &cfg, auth, Some(mock_catalog(model_url)))
+        .expect("valid test config");
+    (agent, temp)
+}
+
+/// Guards the turn harness itself.
+///
+/// T14, T19/T20 and T23 all rest on a session being able to complete a prompt.
+/// If that ever stops working those tests would go quiet in a way that reads
+/// like "the policy blocked it", so the ability to run a turn at all is pinned
+/// separately.
+local_test!(turn_harness_completes_a_prompt, async {
+    let (model_url, model_hits) = spawn_mock_model().await;
+    let (a, tmp) = agent_with_model(&model_url);
+    init(&a).await;
+    let sid = ordinary_session(&a, tmp.path()).await;
+
+    let resp = a
+        .prompt(acp::PromptRequest::new(
+            sid.clone(),
+            vec![acp::ContentBlock::from("hello")],
+        ))
+        .await
+        .expect("prompt must succeed");
+    assert_eq!(resp.stop_reason, acp::StopReason::EndTurn);
+    assert_eq!(
+        model_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the turn must have reached the mock model"
+    );
+});
