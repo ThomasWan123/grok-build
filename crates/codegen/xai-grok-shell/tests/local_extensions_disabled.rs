@@ -2041,3 +2041,169 @@ local_test!(t23b_every_extension_arm_refuses_before_acting, async {
         assert_eq!(after, before, "{cmd}: a refused command must change nothing");
     }
 });
+
+// ---------------------------------------------------------------------------
+// T14 — hooks carried by the agent definition (source D3)
+// ---------------------------------------------------------------------------
+
+/// A hook script that appends the envelope it receives on stdin.
+///
+/// One line of JSON per firing, so the test attributes hits by the envelope's
+/// own `session_id` / `cwd` fields rather than by counting lines.
+fn hook_sentinel(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = dir.join("hook-hits.jsonl");
+    let script = dir.join("led-hook.cmd");
+    std::fs::write(
+        &script,
+        format!("@echo off
+more >> \"{}\"
+", log.display()),
+    )
+    .expect("hook script");
+    (script, log)
+}
+
+fn hook_lines(log: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// The agent profile both sessions receive — byte-identical by construction.
+fn inline_hook_profile(script: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "name": "led-inline-hook-agent",
+        "description": "carries an inline hook",
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{ "type": "command", "command": script.display().to_string() }]
+            }]
+        }
+    })
+}
+
+/// Sentinel lines attributable to one session, by exact field match.
+///
+/// Not a count and not a substring search: both sessions in this test run the
+/// same hook script against the same log, so attribution has to come from the
+/// envelope's own `sessionId`.
+fn hook_hits_for(log: &std::path::Path, sid: &acp::SessionId) -> Vec<serde_json::Value> {
+    hook_lines(log)
+        .into_iter()
+        .filter(|l| l.get("sessionId").and_then(|v| v.as_str()) == Some(sid.0.as_ref()))
+        .collect()
+}
+
+local_test!(t14_agent_defined_hooks_fire_for_code_and_never_for_restricted, async {
+    let hook_dir = tempfile::tempdir().expect("hook dir");
+    let (script, log) = hook_sentinel(hook_dir.path());
+    let profile = inline_hook_profile(&script);
+    let (model_url, model_hits) = spawn_mock_model().await;
+    let (a, tmp) = agent_with_model(&model_url);
+    init(&a).await;
+
+    // Both sessions get the *same* profile value — same hook, same script, same
+    // log — so any difference in outcome is the policy and nothing else.
+    let ordinary = new_session(
+        &a,
+        tmp.path(),
+        meta(serde_json::json!({ "agentProfile": profile })),
+    )
+    .await
+    .expect("ordinary session")
+    .session_id;
+    let restricted_cwd = tempfile::tempdir().expect("cwd");
+    let restricted = new_session(
+        &a,
+        restricted_cwd.path(),
+        meta(serde_json::json!({ KEY: true, "agentProfile": profile })),
+    )
+    .await
+    .expect("restricted session")
+    .session_id;
+
+    // --- Code side: the hook is installed, visible, and fires -------------
+    let listed = ext(
+        &a,
+        "x.ai/hooks/list",
+        serde_json::json!({ "sessionId": ordinary.0 }),
+    )
+    .await
+    .expect("hooks/list");
+    let names: Vec<String> = listed["hooks"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|h| h["name"].as_str())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        names.iter().any(|n| n.contains("led-inline-hook-agent")),
+        "the ordinary session must list the agent's hook; got {names:?}"
+    );
+
+    let model_before = model_hits.load(std::sync::atomic::Ordering::SeqCst);
+    a.prompt(acp::PromptRequest::new(
+        ordinary.clone(),
+        vec![acp::ContentBlock::from("hello")],
+    ))
+    .await
+    .expect("ordinary prompt");
+    assert!(
+        model_hits.load(std::sync::atomic::Ordering::SeqCst) > model_before,
+        "the ordinary turn must actually have run"
+    );
+    assert!(
+        wait_for(|| !hook_hits_for(&log, &ordinary).is_empty()).await,
+        "the agent's hook must fire for the ordinary session"
+    );
+    let ordinary_hits = hook_hits_for(&log, &ordinary);
+    assert_eq!(
+        ordinary_hits[0]["cwd"].as_str(),
+        Some(tmp.path().to_string_lossy().as_ref()),
+        "and must be attributed to that session's cwd"
+    );
+
+    // --- Restricted side: nothing, and the turn still ran -----------------
+    let restricted_listed = ext(
+        &a,
+        "x.ai/hooks/list",
+        serde_json::json!({ "sessionId": restricted.0 }),
+    )
+    .await
+    .expect("hooks/list");
+    assert_eq!(restricted_listed["hooks"], serde_json::json!([]));
+
+    let model_before = model_hits.load(std::sync::atomic::Ordering::SeqCst);
+    let lines_before = hook_lines(&log).len();
+    a.prompt(acp::PromptRequest::new(
+        restricted.clone(),
+        vec![acp::ContentBlock::from("hello")],
+    ))
+    .await
+    .expect("restricted prompt");
+    // Without this the whole negative half could pass because the turn never
+    // ran — the failure mode that looks exactly like a working interception.
+    assert!(
+        model_hits.load(std::sync::atomic::Ordering::SeqCst) > model_before,
+        "the restricted turn must actually have run"
+    );
+
+    // Same budget the positive half needed before concluding "never fired".
+    let fired = wait_for(|| !hook_hits_for(&log, &restricted).is_empty()).await;
+    assert!(
+        !fired,
+        "the agent's hook must not fire for a restricted session; hits={:?}",
+        hook_hits_for(&log, &restricted)
+    );
+    assert_eq!(
+        hook_lines(&log).len(),
+        lines_before,
+        "and must add no sentinel line at all"
+    );
+});
