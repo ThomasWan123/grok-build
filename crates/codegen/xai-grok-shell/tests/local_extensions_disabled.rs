@@ -132,23 +132,32 @@ fn seed_fresh_xai_oidc_auth(dir: &std::path::Path) {
 ///
 /// Child processes get theirs via `Command::env` instead, which never touches
 /// this process at all.
-fn scratch_home() -> &'static std::path::Path {
-    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+fn scratch_home() {
+    static HOME: std::sync::OnceLock<Option<tempfile::TempDir>> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
+        // A child spawned by `t16_e2_restricted_child_neither_lists_nor_connects`
+        // is handed its home through `Command::env`. Overwriting it here would
+        // silently discard the isolation the parent set up, so an inherited
+        // value is left exactly as it is — and the child then performs no
+        // environment write at all.
+        if std::env::var_os("GROK_HOME").is_some() {
+            return None;
+        }
         let dir = tempfile::tempdir().expect("scratch home");
         // SAFETY: runs once, at the first agent construction, before any agent
-        // has spawned a thread that reads the environment.
+        // has spawned a thread that reads the environment; the runtime is
+        // single-threaded (asserted in `local_test!`) and the dedicated command
+        // pins `--test-threads=1`.
         unsafe { std::env::set_var("GROK_HOME", dir.path()) };
-        dir
-    })
-    .path()
+        Some(dir)
+    });
 }
 
 fn agent_full(
     plugin_dirs: &[&std::path::Path],
     managed_proxy_url: Option<&str>,
 ) -> (MvpAgent, tempfile::TempDir) {
-    let _ = scratch_home();
+    scratch_home();
     let temp = tempfile::tempdir().expect("temp dir");
     // Every agent gets a credential, not just the managed ones: it is also what
     // makes `initialize` select a default auth method, which `session/new`
@@ -240,9 +249,19 @@ fn applied(resp_meta: &Option<acp::Meta>) -> Option<&serde_json::Value> {
 
 macro_rules! local_test {
     ($name:ident, $body:expr) => {
-        #[tokio::test]
+        // `current_thread` is load-bearing, not incidental: `scratch_home()`
+        // writes `GROK_HOME` once, and that write is only sound while no other
+        // thread can be reading the environment. Combined with
+        // `--test-threads=1`, this keeps the whole file single-threaded on the
+        // Tokio side.
+        #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn $name() {
+            assert_eq!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread,
+                "this file's one environment write is only sound on a                  single-threaded runtime; see scratch_home()"
+            );
             // The session actor is spawned onto the current LocalSet.
             tokio::task::LocalSet::new().run_until($body).await
         }
@@ -1456,26 +1475,144 @@ local_test!(t17_e2_managed_mcp_control_and_data_plane, async {
     );
 });
 
-// T16-E2 — NOT YET GREEN. Shape is settled and the blocking UB is gone; what
-// remains is a child-process harness problem, recorded here rather than left as
-// a hanging test.
+// ---------------------------------------------------------------------------
+// T16-E2 — the negative half, in a child process
 //
-// Shape: the parent proves the fixture live and takes a baseline, then
-// re-executes this binary with `Command::env` (`GROK_HOME`, proxy URL, a child
-// marker) so the child gets its own process — and therefore its own managed
-// cache — without this process's environment ever being written. The child
-// creates exactly one restricted session; the parent then asserts both
-// `/proxy/mcp/configs` and `/mcp/e2` are unchanged.
+// The agent under test needs a managed cache that is genuinely its own: sharing
+// one with the positive agent would let "zero fetches" be a cache hit rather
+// than a policy decision. A second in-process agent cannot provide that — the
+// environment it needs can only be set with `std::env::set_var`, unsound once
+// the first agent's reqwest and MCP workers are running (that is what aborted
+// with STATUS_HEAP_CORRUPTION).
 //
-// Why a child rather than a second in-process agent: a shared managed cache
-// would let "zero fetches" be a cache hit rather than a policy decision, and
-// the environment a second agent needs can only be set with
-// `std::env::set_var`, which is unsound once the first agent's reqwest and MCP
-// workers are running (that is what aborted with STATUS_HEAP_CORRUPTION).
+// Re-executing this binary solves both: `Command::env` configures the child
+// without touching this process, and a fresh process has a fresh cache by
+// construction.
 //
-// Open problem: the spawned child did not finish within 10 minutes. Not yet
-// diagnosed. First suspect is `scratch_home()`, which unconditionally writes
-// `GROK_HOME` and would therefore override the value `Command::env` passed in;
-// the child branch needs to honour an inherited home instead.
+// The parent must wait *asynchronously*. The fixture serves `/proxy/mcp/configs`
+// and `/mcp/e2` from this process's current-thread runtime, so a blocking wait
+// stops answering the very requests the child would make — the child then waits
+// on a response that can never arrive, and the two deadlock. An earlier
+// revision did exactly that and hung past ten minutes.
+// ---------------------------------------------------------------------------
+
+const CHILD_PROXY: &str = "LED_T16_E2_PROXY";
+
+/// The child: one restricted session on a managed-MCP-enabled agent, then exit.
+///
+/// Registered as a test so the harness can select it by name. The marker check
+/// is the first statement so a parent run exits immediately and cannot recurse
+/// into spawning further children.
+#[tokio::test(flavor = "current_thread")]
+async fn t16_e2_child_worker() {
+    let Ok(proxy) = std::env::var(CHILD_PROXY) else {
+        return; // parent run: inert
+    };
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (a, tmp) = agent_full(&[], Some(&proxy));
+            init(&a).await;
+            let sid = disabled_session(&a, tmp.path()).await;
+            assert_eq!(
+                a.session_local_extensions_disabled_snapshot(&sid),
+                Some(true),
+                "the child must actually have created a restricted session"
+            );
+            // Hold open for the same budget the parent's positive half needed,
+            // so the parent is not measuring a window that never opened.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        })
+        .await;
+}
+
+local_test!(t16_e2_restricted_child_neither_lists_nor_connects, async {
+    let (base, hits) = spawn_mcp_fixture().await;
+    let proxy = proxy_base(&base);
+
+    // Prove the fixture and credential live here first: a quiet child proves
+    // nothing if managed MCP was broken to begin with.
+    //
+    // Held for the rest of the test rather than scoped to a block. Dropping an
+    // agent while its MCP and reqwest workers are still running corrupts the
+    // heap, so agents in this file live as long as the test does.
+    let (prover, prover_tmp) = agent_full(&[], Some(&proxy));
+    init(&prover).await;
+    ordinary_session(&prover, prover_tmp.path()).await;
+    let live = wait_for(|| {
+        let h = hits.lock().unwrap();
+        h.managed_configs >= 1 && h.initialize.get("e2").copied().unwrap_or(0) >= 1
+    })
+    .await;
+    assert!(
+        live,
+        "the managed fixture must be proven live before measuring the child"
+    );
+
+    let baseline = {
+        let h = hits.lock().unwrap();
+        (
+            h.managed_configs,
+            h.initialize.get("e2").copied().unwrap_or(0),
+        )
+    };
+
+    let child_home = tempfile::tempdir().expect("child home");
+    let exe = std::env::current_exe().expect("test binary path");
+    // Async wait, so this runtime keeps serving the fixture while the child
+    // runs. Bounded, so a wedged child fails the test instead of hanging it.
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new(exe)
+            .args([
+                "t16_e2_child_worker",
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            // Child-only configuration; this process's environment is never
+            // written. The child's `scratch_home()` honours the inherited home
+            // rather than replacing it.
+            .env(CHILD_PROXY, &proxy)
+            .env("GROK_HOME", child_home.path())
+            .status(),
+    )
+    .await
+    .expect("child worker must finish within the timeout")
+    .expect("run child");
+    assert!(status.success(), "child worker must exit cleanly: {status:?}");
+
+    let h = hits.lock().unwrap();
+    // Data plane is what the policy governs, and it must not move at all: the
+    // restricted session connected to no managed server.
+    assert_eq!(
+        h.initialize.get("e2").copied().unwrap_or(0),
+        baseline.1,
+        "a restricted session must not connect to a managed MCP server;          initialize={:?}",
+        h.initialize
+    );
+    assert_eq!(
+        h.tools_list.get("e2").copied().unwrap_or(0),
+        baseline.1,
+        "and must not list its tools either; tools_list={:?}",
+        h.tools_list
+    );
+    // Control plane moves by exactly one, and that one is *not* attributable to
+    // the session: an agent with managed MCP enabled lists connectors while
+    // coming up, before any session exists. Measured, not assumed — a child
+    // that creates no session at all produces the same single hit. Asserting
+    // `+1` rather than `unchanged` keeps the check sharp: a session-triggered
+    // fetch would show up as a second one.
+    assert_eq!(
+        h.managed_configs,
+        baseline.0 + 1,
+        "exactly one agent-level listing, none attributable to the restricted          session; baseline={} now={}",
+        baseline.0,
+        h.managed_configs
+    );
+    drop(h);
+    // Keeps the prover (and its workers) alive to here.
+    assert!(prover_tmp.path().exists());
+    drop(prover);
+});
 
 
