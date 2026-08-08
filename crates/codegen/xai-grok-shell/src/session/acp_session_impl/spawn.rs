@@ -194,6 +194,9 @@ pub(crate) async fn spawn_session_actor(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
+    // NB: a test-only failpoint can force this to `false` after the caller
+    // decided otherwise; see `LATCH_DROP_FAILPOINT`.
+    //
     // Session-scoped policy: built-in tools only, every external extension
     // channel zeroed. Callers are responsible for zeroing the *inputs* they
     // own (`plugin_registry`, `lsp`, MCP lists, client hooks); this function
@@ -209,6 +212,9 @@ pub(crate) async fn spawn_session_actor(
     ),
     xai_grok_agent::AgentBuildError,
 > {
+    #[cfg(feature = "local-extensions-test-support")]
+    let local_extensions_disabled = local_extensions_disabled
+        && !*crate::agent::mvp_agent::LATCH_DROP_FAILPOINT.lock().unwrap();
     if max_turns == Some(0) {
         return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
             "max_turns must be greater than 0".to_string(),

@@ -379,6 +379,15 @@ impl MvpAgent {
     pub fn remove_session_for_test(&self, session_id: &acp::SessionId) {
         self.sessions.borrow_mut().remove(session_id);
     }
+    /// Number of handles currently installed in the live-session map.
+    ///
+    /// Read-only test observation used to prove an assembly failure did not
+    /// register an otherwise unreachable session whose generated id was never
+    /// returned to the caller.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn live_session_count(&self) -> usize {
+        self.sessions.borrow().len()
+    }
     /// Install a pause point inside `session/load` (see [`TestLoadBarrier`]).
     ///
     /// The returned handle is shared with the agent; the caller releases it.
@@ -430,6 +439,21 @@ impl MvpAgent {
         *crate::agent::subagent::handle_request::LAST_SUBAGENT_PLUGIN_COUNT
             .lock()
             .unwrap() = None;
+    }
+    /// Arm or disarm the session-assembly failpoint.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn set_assembly_failpoint(armed: bool) {
+        *super::ASSEMBLY_FAILPOINT.lock().unwrap() = armed;
+    }
+    /// Arm or disarm the latch-drop failpoint.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn set_latch_drop_failpoint(armed: bool) {
+        *super::LATCH_DROP_FAILPOINT.lock().unwrap() = armed;
+    }
+    /// Times the assembly failpoint has fired.
+    #[cfg(feature = "local-extensions-test-support")]
+    pub fn assembly_failpoint_hits() -> usize {
+        *super::ASSEMBLY_FAILPOINT_HITS.lock().unwrap()
     }
     /// Servers the last session assembled from the three LSP sources.
     #[cfg(feature = "local-extensions-test-support")]
@@ -3781,6 +3805,14 @@ impl MvpAgent {
                 code_nav: client_code_nav_enabled,
                 git_head_changed,
             });
+            #[cfg(feature = "local-extensions-test-support")]
+            if *super::ASSEMBLY_FAILPOINT.lock().unwrap() {
+                *super::ASSEMBLY_FAILPOINT_HITS.lock().unwrap() += 1;
+                return Err(
+                    acp::Error::internal_error()
+                        .data(serde_json::json!({ "code": "session_assembly_failed" })),
+                );
+            }
             spawn_session_on_thread(
                     session_info.clone(),
                     self.gateway.clone(),

@@ -2726,3 +2726,202 @@ local_test!(t13_lsp_three_sources_for_code_none_for_restricted, async {
     );
     let _ = code_again;
 });
+
+// ---------------------------------------------------------------------------
+// T7 — a session that fails to assemble is never confirmed
+//
+// The failpoint sits after the policy has been parsed and validated and after
+// every policy-derived argument has been computed, but before any
+// `SessionHandle` exists, is registered, or a response is built. Failing
+// earlier would make this test tautological: a request rejected during parsing
+// obviously carries no confirmation field.
+//
+// New and Load share `spawn_and_register_session`, so one failpoint serves both
+// wire entry points — and both are exercised, because the confirmation is
+// written in two separate places.
+// ---------------------------------------------------------------------------
+
+/// `true` if the key appears anywhere in the value, at any depth.
+fn mentions_applied(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(o) => {
+            o.contains_key(APPLIED) || o.values().any(mentions_applied)
+        }
+        serde_json::Value::Array(a) => a.iter().any(mentions_applied),
+        serde_json::Value::String(s) => s.contains(APPLIED),
+        _ => false,
+    }
+}
+
+/// Failpoints are process-global test scaffolding. Always disarm them even
+/// when an assertion panics, or a later case could fail for the wrong reason.
+struct T7FailpointReset;
+
+impl Drop for T7FailpointReset {
+    fn drop(&mut self) {
+        MvpAgent::set_assembly_failpoint(false);
+        MvpAgent::set_latch_drop_failpoint(false);
+    }
+}
+
+local_test!(t7_failed_assembly_is_never_confirmed, async {
+    let _failpoint_reset = T7FailpointReset;
+    MvpAgent::set_assembly_failpoint(false);
+    MvpAgent::set_latch_drop_failpoint(false);
+    let plugin = plugin_fixture("t7-plugin");
+    let (mcp_base, mcp_hits) = spawn_mcp_fixture().await;
+    let (a, tmp) = agent_with_plugins(&[plugin.path()]);
+    init(&a).await;
+    let _ = mcp_base;
+
+    let request_meta = || meta(serde_json::json!({ KEY: true }));
+
+    // Baselines for the side effects a half-assembled session could leave.
+    let mcp_before = {
+        let h = mcp_hits.lock().unwrap();
+        h.initialize.len() + h.managed_configs
+    };
+    let lsp_managers_before = MvpAgent::lsp_manager_constructions();
+    let ensure_before = a.ensure_plugin_registry_call_count();
+    let sessions_before = a.live_session_count();
+
+    // --- New: assembly fails -------------------------------------------
+    MvpAgent::set_assembly_failpoint(true);
+    let hits_before = MvpAgent::assembly_failpoint_hits();
+    let err = new_session(&a, tmp.path(), request_meta())
+        .await
+        .expect_err("assembly must fail");
+    assert!(
+        MvpAgent::assembly_failpoint_hits() > hits_before,
+        "the request must have reached the failpoint, not failed earlier"
+    );
+    let err_value = serde_json::json!({
+        "code": format!("{:?}", err.code),
+        "message": err.message,
+        "data": err.data,
+    });
+    assert_eq!(err_value["data"]["code"], "session_assembly_failed");
+    assert!(
+        !mentions_applied(&err_value),
+        "a failed assembly must not confirm the policy anywhere in its error: {err_value}"
+    );
+
+    // No session, and none of the side effects a real assembly would leave.
+    assert_eq!(
+        a.live_session_count(),
+        sessions_before,
+        "a failed assembly must not install an unreachable live handle"
+    );
+    assert_eq!(
+        {
+            let h = mcp_hits.lock().unwrap();
+            h.initialize.len() + h.managed_configs
+        },
+        mcp_before,
+        "a failed assembly must not have connected anything"
+    );
+    assert_eq!(
+        MvpAgent::lsp_manager_constructions(),
+        lsp_managers_before,
+        "nor constructed an LspManager"
+    );
+    assert_eq!(
+        a.ensure_plugin_registry_call_count(),
+        ensure_before,
+        "nor initialized the shared plugin registry"
+    );
+
+    // --- The same request succeeds once the failpoint is disarmed ---------
+    MvpAgent::set_assembly_failpoint(false);
+    let resp = new_session(&a, tmp.path(), request_meta())
+        .await
+        .expect("the same request must succeed with the failpoint disarmed");
+    let sid = resp.session_id.clone();
+    assert_eq!(
+        applied(&resp.meta),
+        Some(&serde_json::Value::Bool(true)),
+        "proving the request and fixture were valid all along"
+    );
+    assert_eq!(a.session_local_extensions_disabled_snapshot(&sid), Some(true));
+
+    // A successful assembly whose actual latch is false must not echo the
+    // requested value. This is the discriminating half of T7: an
+    // implementation that builds the confirmation from request metadata would
+    // incorrectly emit `applied=true` here.
+    MvpAgent::set_latch_drop_failpoint(true);
+    let resp = new_session(&a, tmp.path(), request_meta())
+        .await
+        .expect("latch-drop assembly itself succeeds");
+    let dropped_new_sid = resp.session_id.clone();
+    assert_eq!(
+        applied(&resp.meta),
+        None,
+        "new-session confirmation must follow the installed latch, not the request"
+    );
+    assert_eq!(
+        a.session_local_extensions_disabled_snapshot(&dropped_new_sid),
+        Some(false),
+        "the test must really have dropped the installed latch"
+    );
+    MvpAgent::set_latch_drop_failpoint(false);
+    a.remove_session_for_test(&dropped_new_sid);
+
+    // --- Load: the other confirmation site, same failpoint ----------------
+    a.remove_session_for_test(&sid);
+    assert_eq!(
+        a.session_local_extensions_disabled_snapshot(&sid),
+        None,
+        "the session must be out of the map so the load really re-assembles"
+    );
+    MvpAgent::set_assembly_failpoint(true);
+    let hits_before = MvpAgent::assembly_failpoint_hits();
+    let err = load_session(&a, &sid, tmp.path(), request_meta())
+        .await
+        .expect_err("load assembly must fail");
+    assert!(
+        MvpAgent::assembly_failpoint_hits() > hits_before,
+        "the load must have reached the failpoint too"
+    );
+    let err_value = serde_json::json!({
+        "code": format!("{:?}", err.code),
+        "message": err.message,
+        "data": err.data,
+    });
+    assert!(
+        !mentions_applied(&err_value),
+        "a failed load must not confirm the policy either: {err_value}"
+    );
+    assert_eq!(
+        a.session_local_extensions_disabled_snapshot(&sid),
+        None,
+        "and must not have registered a session"
+    );
+
+    // --- And the same load succeeds once disarmed -------------------------
+    MvpAgent::set_assembly_failpoint(false);
+    let resp = load_session(&a, &sid, tmp.path(), request_meta())
+        .await
+        .expect("the same load must succeed with the failpoint disarmed");
+    assert_eq!(
+        applied(&resp.meta),
+        Some(&serde_json::Value::Bool(true)),
+        "the load confirmation site must work when assembly does"
+    );
+
+    // The second response site must use the loaded handle's latch as well.
+    a.remove_session_for_test(&sid);
+    MvpAgent::set_latch_drop_failpoint(true);
+    let resp = load_session(&a, &sid, tmp.path(), request_meta())
+        .await
+        .expect("latch-drop load itself succeeds");
+    assert_eq!(
+        applied(&resp.meta),
+        None,
+        "load confirmation must follow the installed latch, not the request"
+    );
+    assert_eq!(
+        a.session_local_extensions_disabled_snapshot(&sid),
+        Some(false),
+        "the loaded handle must expose the dropped latch"
+    );
+});

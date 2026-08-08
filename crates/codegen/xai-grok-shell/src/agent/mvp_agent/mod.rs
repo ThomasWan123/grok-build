@@ -113,6 +113,30 @@ pub(crate) fn reject_direct_hub_cloud_meta(
     }
     Ok(())
 }
+/// Arms a deterministic failure inside session assembly (test-only).
+///
+/// Placed after the policy has been parsed and validated and after every
+/// policy-derived argument has been computed, but before any `SessionHandle`
+/// exists, is registered, or a response is built. That position is the point:
+/// a failure earlier would prove only that a rejected request has no
+/// confirmation field, which is true by construction.
+#[cfg(feature = "local-extensions-test-support")]
+pub static ASSEMBLY_FAILPOINT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+/// Times the failpoint was reached, so a test can prove it actually fired
+/// rather than the request failing somewhere else.
+#[cfg(feature = "local-extensions-test-support")]
+pub static ASSEMBLY_FAILPOINT_HITS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+/// Forces the latch to `false` while leaving assembly otherwise successful
+/// (test-only).
+///
+/// Models the case the confirmation exists to catch: the request asked for the
+/// policy, assembly succeeded, but the session did not end up protected. A
+/// confirmation derived from the request would claim success here; one derived
+/// from the latch cannot.
+#[cfg(feature = "local-extensions-test-support")]
+pub static LATCH_DROP_FAILPOINT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
 /// Servers the last session assembled from the three LSP sources (test-only).
 #[cfg(feature = "local-extensions-test-support")]
 pub static LAST_LSP_SERVER_NAMES: std::sync::Mutex<Vec<String>> =
