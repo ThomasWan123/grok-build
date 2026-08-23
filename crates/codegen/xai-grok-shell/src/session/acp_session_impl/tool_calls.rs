@@ -406,11 +406,17 @@ impl SessionActor {
         let workspace_ops = self.workspace_ops.clone();
         let pending_interjections = self.pending_interjections.clone();
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
-        let dispatch_futures: Vec<_> = approved
+        // Reads use a bounded rolling window. A mutation is a global barrier:
+        // it waits for every earlier read and no later call can pass it. This
+        // is deliberately stronger than the old same-path mutex, which still
+        // allowed a shell command and an unrelated write to race.
+        const MAX_CONCURRENT_READS: usize = 4;
+        let dispatch_futures: std::collections::VecDeque<_> = approved
             .iter()
             .enumerate()
             .map(|(idx, prepared)| {
                 let prepared = Arc::new(prepared.clone());
+                let is_read_only = prepared.is_read_only;
                 let am = self.auth_manager.clone();
                 let shared_recovery = Arc::clone(&shared_recovery);
                 let workspace_ops = workspace_ops.clone();
@@ -421,7 +427,7 @@ impl SessionActor {
                     is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args);
                 let lock = lock_path_for_args(&prepared.parsed_args)
                     .and_then(|fp| file_locks.get(fp).cloned());
-                async move {
+                (is_read_only, async move {
                     let exec_start = std::time::Instant::now();
                     let run_tool = || {
                         let prepared = Arc::clone(&prepared);
@@ -469,21 +475,46 @@ impl SessionActor {
                             success, }
                         )),
                     );
-                    (idx, result)
-                }
+                    (idx, is_read_only, result)
+                })
             })
             .collect();
         tokio::task::yield_now().await;
-        let mut dispatch_stream = futures::stream::FuturesUnordered::new();
-        for fut in dispatch_futures {
-            dispatch_stream.push(fut);
-        }
         let mut approved_slots: Vec<Option<PreparedToolCall>> =
             approved.into_iter().map(Some).collect();
         let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, _)>();
         let drainer = tokio::spawn(async move {
-            while let Some(item) = dispatch_stream.next().await {
-                if dispatch_tx.send(item).is_err() {
+            let mut pending = dispatch_futures;
+            let mut running = futures::stream::FuturesUnordered::new();
+            let mut mutation_running = false;
+            loop {
+                if !mutation_running {
+                    while running.len() < MAX_CONCURRENT_READS {
+                        let Some(next_is_read_only) =
+                            pending.front().map(|(is_read_only, _)| *is_read_only)
+                        else {
+                            break;
+                        };
+                        if !next_is_read_only && !running.is_empty() {
+                            break;
+                        }
+                        let (_, future) = pending.pop_front().expect("pending front exists");
+                        mutation_running = !next_is_read_only;
+                        running.push(future);
+                        if mutation_running {
+                            break;
+                        }
+                    }
+                }
+
+                let Some((idx, was_read_only, result)) = running.next().await else {
+                    debug_assert!(pending.is_empty());
+                    break;
+                };
+                if !was_read_only {
+                    mutation_running = false;
+                }
+                if dispatch_tx.send((idx, result)).is_err() {
                     break;
                 }
             }
