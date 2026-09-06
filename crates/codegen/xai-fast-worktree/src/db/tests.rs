@@ -54,6 +54,17 @@ fn get_by_path() {
 }
 
 #[test]
+fn get_by_backslash_path_uses_path_lookup() {
+    let db = WorktreeDb::open_in_memory().unwrap();
+    let path = r"C:\\managed\\wt-xyz";
+    db.register(&make_record("xyz", path, WorktreeKind::Fork))
+        .unwrap();
+
+    let fetched = db.get(path).unwrap().expect("should find Windows path");
+    assert_eq!(fetched.id, "xyz");
+}
+
+#[test]
 fn get_missing_returns_none() {
     let db = WorktreeDb::open_in_memory().unwrap();
     assert!(db.get("nonexistent").unwrap().is_none());

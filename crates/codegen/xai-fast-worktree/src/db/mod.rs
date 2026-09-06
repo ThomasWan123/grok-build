@@ -275,7 +275,10 @@ impl WorktreeDb {
     /// before lookup). Otherwise it's looked up first as a DB ID, then as a
     /// worktree label (stored in `metadata.label`).
     pub fn get(&self, id_or_path: &str) -> Result<Option<WorktreeRecord>> {
-        if id_or_path.contains('/') {
+        if Path::new(id_or_path).is_absolute()
+            || id_or_path.contains('/')
+            || id_or_path.contains('\\')
+        {
             let canon = PathBuf::from(id_or_path);
             let canon = dunce::canonicalize(&canon).unwrap_or(canon);
             queries::get_by_path(&self.conn, &canon)

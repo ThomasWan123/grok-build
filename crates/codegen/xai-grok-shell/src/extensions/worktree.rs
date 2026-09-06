@@ -514,6 +514,7 @@ mod tests {
         let req = RemoveWorktreeRequest {
             worktree_path: Some("/a".into()),
             id_or_path: Some("b".into()),
+            expected_source_repo: None,
             force: false,
             dry_run: false,
         };
@@ -537,6 +538,7 @@ mod tests {
         let req = RemoveWorktreeRequest {
             worktree_path: None,
             id_or_path: None,
+            expected_source_repo: None,
             force: false,
             dry_run: false,
         };
