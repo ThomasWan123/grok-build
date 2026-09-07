@@ -1,0 +1,45 @@
+name: worktree-boundary
+
+on:
+  pull_request:
+    branches:
+      - wancode-integration
+    paths:
+      - ".github/workflows/worktree-boundary.yml"
+      - "crates/codegen/xai-fast-worktree/**"
+      - "crates/codegen/xai-grok-workspace/**"
+      - "crates/codegen/xai-grok-workspace-types/**"
+      - "crates/codegen/xai-grok-shell/src/extensions/worktree.rs"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  push:
+    branches:
+      - wancode-integration
+    paths:
+      - ".github/workflows/worktree-boundary.yml"
+      - "crates/codegen/xai-fast-worktree/**"
+      - "crates/codegen/xai-grok-workspace/**"
+      - "crates/codegen/xai-grok-workspace-types/**"
+      - "crates/codegen/xai-grok-shell/src/extensions/worktree.rs"
+      - "Cargo.lock"
+      - "Cargo.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  registered-target-boundary:
+    name: registered-target-boundary (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Windows path lookup regression
+        run: cargo test --locked -p xai-fast-worktree --features metadata get_by_backslash_path_uses_path_lookup
+      - name: Registered target containment
+        run: cargo test --locked -p xai-grok-workspace registered_target_resolution_
