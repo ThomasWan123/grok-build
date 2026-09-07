@@ -1121,17 +1121,16 @@ pub async fn remove_worktree(
     req: &RemoveWorktreeRequest,
     copy_context: &BackgroundCopyContext,
 ) -> Result<RemoveWorktreeResponse> {
-    let resolved = match (&req.worktree_path, &req.id_or_path) {
+    let target = match (&req.worktree_path, &req.id_or_path) {
         (Some(_), Some(_)) => {
             anyhow::bail!("exactly one of worktreePath or idOrPath must be set, not both")
         }
-        (Some(path), None) => path.clone(),
-        (None, Some(id)) => match resolve_worktree_by_id_or_path(id)? {
-            Some(p) => p.display().to_string(),
-            None => anyhow::bail!("worktree not found: {id}"),
-        },
+        (Some(path), None) => path.as_str(),
+        (None, Some(id)) => id.as_str(),
         (None, None) => anyhow::bail!("either worktreePath or idOrPath must be set"),
     };
+    let record = resolve_registered_worktree_target(target, req.expected_source_repo.as_deref())?;
+    let resolved = record.path.display().to_string();
     let worktree_path = Path::new(&resolved);
 
     tracing::info!(
@@ -2115,7 +2114,14 @@ async fn apply_file_content(dest: &Path, content: Option<&String>) -> bool {
 }
 
 pub async fn apply_worktree(req: &ApplyWorktreeRequest) -> Result<ApplyWorktreeResponse> {
-    let worktree_path = &req.worktree_path;
+    let record = resolve_registered_worktree_target(
+        &req.worktree_path,
+        req.expected_source_repo.as_deref(),
+    )?;
+    let worktree_path = record
+        .path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("registered worktree path is not valid UTF-8"))?;
     let git_root = find_main_repo_root_from_path(Path::new(worktree_path))?;
     let git_root_str = git_root.to_string_lossy().to_string();
     let ctx = get_apply_context(worktree_path).await?;
@@ -2434,15 +2440,44 @@ pub fn worktree_db_path() -> Result<std::path::PathBuf> {
     Ok(home.join("worktrees.db"))
 }
 
-/// Resolve an ID-or-path string to a worktree path via DB lookup,
-/// falling back to treating it as a filesystem path.
+/// Resolve an ID-or-path string through the managed-worktree database.
+///
+/// This retains the public lookup API while deliberately removing the former
+/// fallback that treated any existing directory as a managed worktree.
 pub fn resolve_worktree_by_id_or_path(id_or_path: &str) -> Result<Option<std::path::PathBuf>> {
     let db = open_db()?;
-    if let Some(rec) = db.get(id_or_path)? {
-        return Ok(Some(rec.path));
+    Ok(db.get(id_or_path)?.map(|record| record.path))
+}
+
+/// Resolve an ID-or-path string only when it names a registered managed
+/// worktree. Destructive and write-back operations must never treat an
+/// arbitrary existing directory as an implicit worktree target.
+pub fn resolve_registered_worktree_target(
+    id_or_path: &str,
+    expected_source_repo: Option<&str>,
+) -> Result<WorktreeRecord> {
+    let db = open_db()?;
+    let record = db
+        .get(id_or_path)?
+        .ok_or_else(|| anyhow::anyhow!("managed worktree not found: {id_or_path}"))?;
+    if let Some(expected) = expected_source_repo {
+        let expected = source_repo_identity(Path::new(expected));
+        let actual = source_repo_identity(&record.source_repo);
+        if actual != expected {
+            anyhow::bail!("managed worktree belongs to a different source repository");
+        }
     }
-    let p = std::path::PathBuf::from(id_or_path);
-    if p.exists() { Ok(Some(p)) } else { Ok(None) }
+    Ok(record)
+}
+
+fn canonical_or_original(path: &Path) -> std::path::PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn source_repo_identity(path: &Path) -> std::path::PathBuf {
+    find_main_repo_root_from_path(path)
+        .map(|root| canonical_or_original(&root))
+        .unwrap_or_else(|_| canonical_or_original(path))
 }
 
 // ============================================================================
@@ -2776,6 +2811,38 @@ mod tests {
         };
         db.register(&record).unwrap();
         (env, home, wt)
+    }
+
+    #[test]
+    fn registered_target_resolution_rejects_unmanaged_existing_directory_without_touching_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (_env, _home, _wt) = worktree_db_fixture(&temp);
+        let unmanaged = temp.path().join("unmanaged");
+        std::fs::create_dir_all(&unmanaged).unwrap();
+        let sentinel = unmanaged.join("keep.txt");
+        std::fs::write(&sentinel, b"keep").unwrap();
+
+        let error = resolve_registered_worktree_target(&unmanaged.to_string_lossy(), None)
+            .expect_err("an existing directory without a DB record must be rejected");
+
+        assert!(error.to_string().contains("managed worktree not found"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn registered_target_resolution_binds_target_to_expected_source_repo() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (_env, _home, wt) = worktree_db_fixture(&temp);
+
+        let by_id = resolve_registered_worktree_target("wt", Some("/repo")).unwrap();
+        assert_eq!(by_id.path, wt);
+        let by_path =
+            resolve_registered_worktree_target(&wt.to_string_lossy(), Some("/repo")).unwrap();
+        assert_eq!(by_path.id, "wt");
+
+        let error = resolve_registered_worktree_target("wt", Some("/other-repo"))
+            .expect_err("a different source repository must be rejected");
+        assert!(error.to_string().contains("different source repository"));
     }
 
     #[test]

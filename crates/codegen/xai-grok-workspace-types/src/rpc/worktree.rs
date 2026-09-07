@@ -144,6 +144,10 @@ pub struct RemoveWorktreeRequest {
     /// New field: worktree ID or filesystem path, resolved via DB first.
     #[serde(default)]
     pub id_or_path: Option<String>,
+    /// Optional caller assertion used by embedded clients to bind the target
+    /// to the repository that owns the current session.
+    #[serde(default)]
+    pub expected_source_repo: Option<String>,
     #[serde(default)]
     pub force: bool,
     #[serde(default)]
@@ -230,6 +234,10 @@ pub enum ApplyMode {
 pub struct ApplyWorktreeRequest {
     pub session_id: String,
     pub worktree_path: String,
+    /// Optional caller assertion used to reject a registered worktree from a
+    /// different repository before any files are applied.
+    #[serde(default)]
+    pub expected_source_repo: Option<String>,
     #[serde(default)]
     pub mode: ApplyMode,
 }
